@@ -1,0 +1,17 @@
+{
+  "name": "db-monitoring-ai",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/backend",
+    "apps/frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/backend",
+    "dev:frontend": "npm run dev -w apps/frontend",
+    "build": "npm run build -w apps/backend && npm run build -w apps/frontend",
+    "start": "npm run start -w apps/backend",
+    "lint": "npm run lint -w apps/backend && npm run lint -w apps/frontend",
+    "test": "npm run test -w apps/backend"
+  }
+}
