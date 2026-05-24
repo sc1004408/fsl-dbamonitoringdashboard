@@ -1,3 +1,49 @@
+// --- Scheduler for periodic monitoring snapshot collection ---
+import { monitoringService } from './monitoringService';
+import { setInterval } from 'timers';
+
+// Collect and save monitoring data for all targets every 10 minutes
+const SCHEDULE_INTERVAL_MS = 10 * 60 * 1000;
+async function collectAndSaveAllTargetsSnapshot() {
+  try {
+    const serverState = await listTargets();
+    const now = new Date();
+    for (const target of serverState.targets) {
+      try {
+        const [health, performance, storage, sessions, queries, alerts, backups] = await Promise.all([
+          monitoringService.health(target.id),
+          monitoringService.performance(target.id),
+          monitoringService.storage(target.id),
+          monitoringService.sessions(target.id),
+          monitoringService.topQueries(target.id),
+          monitoringService.alerts(target.id),
+          monitoringService.backups(target.id)
+        ]);
+        await saveDashboardSnapshot({
+          capturedAt: now.toISOString(),
+          targetId: target.id,
+          health,
+          performance,
+          storage,
+          sessions,
+          queries,
+          alerts,
+          backups
+        });
+        // Optionally log success
+      } catch (err) {
+        // Optionally log error for this target
+      }
+    }
+  } catch (err) {
+    // Optionally log error for all targets
+  }
+}
+
+// Start the scheduler only if not in test mode
+if (process.env.NODE_ENV !== 'test') {
+  setInterval(collectAndSaveAllTargetsSnapshot, SCHEDULE_INTERVAL_MS);
+}
 import sql from 'mssql';
 import { env } from '../config/env';
 import { listTargets } from './db';

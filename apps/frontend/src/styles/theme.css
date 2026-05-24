@@ -452,14 +452,33 @@ pre {
 .ai-title-row {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ai-title-row h2 {
+  flex: 1 1 320px;
 }
 
 .snapshot-actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  flex: 1 1 100%;
+}
+
+.snapshot-actions input[type='datetime-local'] {
+  min-width: 200px;
+}
+
+.snapshot-actions button {
+  white-space: nowrap;
+}
+
+.history-back-btn {
+  margin-left: auto;
+  margin-bottom: 8px;
 }
 
 .history-pagination {
@@ -487,8 +506,9 @@ pre {
 }
 
 .btn-off {
-  background: #2d2d2d;
-  color: #fff;
+  background: #ffffff;
+  color: #1f2937;
+  border: 1px solid rgba(19, 34, 23, 0.2);
 }
 
 @keyframes card-in {
