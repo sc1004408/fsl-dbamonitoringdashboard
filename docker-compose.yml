@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: apps/backend/Dockerfile
+    environment:
+      APP_PORT: 4000
     ports:
       - "4000:4000"
     env_file:

@@ -1,7 +1,9 @@
 import cors from 'cors';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import fs from 'fs';
 import helmet from 'helmet';
+import path from 'path';
 import { env } from './config/env';
 import { errorHandler } from './middleware/errorHandler';
 import { monitoringRouter } from './routes/monitoringRoutes';
@@ -18,6 +20,15 @@ app.get('/api/ping', (_req, res) => {
 });
 
 app.use('/api', monitoringRouter);
+
+const frontendDistPath = path.resolve(process.cwd(), 'apps/frontend/dist');
+if (fs.existsSync(frontendDistPath)) {
+  app.use(express.static(frontendDistPath));
+  app.get(/^\/(?!api).*/, (_req, res) => {
+    res.sendFile(path.join(frontendDistPath, 'index.html'));
+  });
+}
+
 app.use(errorHandler);
 
 app.listen(env.APP_PORT, () => {

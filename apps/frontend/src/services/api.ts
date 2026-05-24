@@ -22,11 +22,76 @@ export type SnapshotHistoryResponse = {
   offset: number;
 };
 
+export type MonitoringTableStats = {
+  serverListCount: number;
+  snapshotHeaderCount: number;
+  snapshotDetailCount: number;
+  dashboardSnapshotCount: number;
+  oldestSnapshotAt: string | null;
+  newestSnapshotAt: string | null;
+  retentionDays: number;
+  error: string | null;
+};
+
 export type BackupInfo = {
   database_name: string;
   last_full_backup: string | null;
   last_diff_backup: string | null;
   last_log_backup: string | null;
+};
+
+export type ServerLogin = {
+  login_name: string;
+  login_type: string;
+  is_disabled: number;
+  is_policy_checked: number;
+  is_expiration_checked: number;
+  default_database: string;
+  create_date: string;
+  modify_date: string;
+  server_roles: string;
+};
+
+export type ServerRoleMember = {
+  role_name: string;
+  member_name: string;
+  member_type: string;
+  is_member_disabled: number;
+};
+
+export type DbUser = {
+  database_name: string;
+  user_name: string;
+  user_type: string;
+  login_name: string;
+  default_schema: string;
+  create_date: string;
+  db_roles: string;
+};
+
+export type DbRoleMember = {
+  database_name: string;
+  role_name: string;
+  member_name: string;
+  member_type: string;
+};
+
+export type ObjectPermission = {
+  database_name: string;
+  principal_name: string;
+  principal_type: string;
+  object_name: string;
+  object_type: string;
+  permission_name: string;
+  permission_state: string;
+};
+
+export type SecurityData = {
+  serverLogins: ServerLogin[];
+  serverRoles: ServerRoleMember[];
+  dbUsers: DbUser[];
+  dbRoles: DbRoleMember[];
+  objectPermissions: ObjectPermission[];
 };
 const jsonGet = async <T>(url: string): Promise<T> => {
   const response = await fetch(url);
@@ -121,6 +186,8 @@ export type DbTargetsResponse = {
 };
 
 export const api = {
+  ple: (targetId?: string) => jsonGet<{ node_id: number; node_name: string; page_life_expectancy: number }[]>(withTarget('/api/ple', targetId)),
+  suggestions: (targetId?: string) => jsonGet<{ missingIndexes: any[]; fragmentedIndexes: any[] }>(withTarget('/api/suggestions', targetId)),
   ping: () => jsonGet<{ message: string }>('/api/ping'),
   listTargets: () => jsonGet<DbTargetsResponse>('/api/targets'),
   addTarget: (name: string, connection: ConnectionPayload) =>
@@ -134,6 +201,8 @@ export const api = {
   sessions: (targetId?: string) => jsonGet(withTarget('/api/sessions', targetId)),
   queries: (targetId?: string) => jsonGet(withTarget('/api/queries', targetId)),
   alerts: (targetId?: string) => jsonGet(withTarget('/api/alerts', targetId)),
+  killSession: (sessionId: number, targetId?: string) =>
+    jsonPost<void>(`/api/sessions/${encodeURIComponent(String(sessionId))}/kill`, { targetId }),
   aiInsights: (targetId?: string) =>
     jsonGet<{ summary: string; generatedAt: string }>(withTarget('/api/ai/insights', targetId)),
   backups: (targetId?: string) => jsonGet<BackupInfo[]>(withTarget('/api/backups', targetId)),
@@ -158,4 +227,10 @@ export const api = {
     const qs = search.toString();
     return downloadGet(`/api/snapshots/export?${qs}`);
   },
+  monitoringStats: () => jsonGet<MonitoringTableStats>('/api/admin/monitoring-stats'),
+  security: (targetId?: string) => jsonGet<SecurityData>(withTarget('/api/security', targetId)),
+  deleteTarget: (targetId: string) =>
+    fetch(`/api/targets/${encodeURIComponent(targetId)}`, { method: 'DELETE' }).then((res) => {
+      if (!res.ok) throw new Error('Failed to delete target');
+    }),
 };

@@ -1,3 +1,26 @@
+export const deleteTarget = async (targetId: string): Promise<void> => {
+  await ensureInitialized();
+  if (targetId === defaultTargetId) {
+    throw new Error('Cannot delete the default server');
+  }
+  const target = targets.get(targetId);
+  if (!target) {
+    throw new Error(`Target not found: ${targetId}`);
+  }
+  // Close and remove pool if exists
+  const pool = pools.get(targetId);
+  if (pool) {
+    await pool.close();
+    pools.delete(targetId);
+  }
+  connectPromises.delete(targetId);
+  targets.delete(targetId);
+  // If deleted target was active, reset to default
+  if (activeTargetId === targetId) {
+    activeTargetId = defaultTargetId;
+  }
+  await persistTargets();
+};
 import sql from 'mssql';
 import fs from 'node:fs/promises';
 import path from 'node:path';

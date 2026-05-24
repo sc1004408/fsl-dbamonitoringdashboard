@@ -1,11 +1,30 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { monitoringService } from '../services/monitoringService';
+import { monitoringService, pleAndSuggestionsService, securityService } from '../services/monitoringService';
 import { aiService } from '../services/aiService';
-import { addTarget, listTargets, selectTarget, updateTarget } from '../services/db';
-import { getAllDashboardSnapshots, getDashboardSnapshots, saveDashboardSnapshot } from '../services/snapshotService';
+import { addTarget, listTargets, selectTarget, updateTarget, deleteTarget } from '../services/db';
+import { getAllDashboardSnapshots, getDashboardSnapshots, getMonitoringTableStats, saveDashboardSnapshot } from '../services/snapshotService';
 
 export const monitoringRouter = Router();
+
+// Register new endpoints after router declaration
+monitoringRouter.get('/ple', async (req, res, next) => {
+  try {
+    const targetId = getTargetId(req.query.targetId);
+    res.json(await pleAndSuggestionsService.ple(targetId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+monitoringRouter.get('/suggestions', async (req, res, next) => {
+  try {
+    const targetId = getTargetId(req.query.targetId);
+    res.json(await pleAndSuggestionsService.suggestions(targetId));
+  } catch (error) {
+    next(error);
+  }
+});
 
 const getTargetId = (targetId: unknown): string | undefined =>
   typeof targetId === 'string' && targetId.length > 0 ? targetId : undefined;
@@ -27,6 +46,10 @@ const addTargetSchema = z.object({
 
 const selectTargetSchema = z.object({
   targetId: z.string().min(1)
+});
+
+const killSessionSchema = z.object({
+  targetId: z.string().optional()
 });
 
 const updateTargetSchema = z.object({
@@ -55,6 +78,38 @@ const toCsvCell = (value: unknown): string => {
   const raw = typeof value === 'string' ? value : JSON.stringify(value);
   const escaped = String(raw ?? '').replace(/"/g, '""');
   return `"${escaped}"`;
+};
+
+const writeSessionKillAudit = async (
+  targetId: string,
+  sessionId: number,
+  outcome: 'attempted' | 'succeeded' | 'failed',
+  detail?: string,
+) => {
+  try {
+    await saveDashboardSnapshot({
+      capturedAt: new Date().toISOString(),
+      targetId,
+      health: {
+        status: 'audit',
+        eventType: 'kill-session',
+        outcome,
+        sessionId,
+        detail: detail ?? null
+      },
+      performance: {},
+      storage: {},
+      sessions: {},
+      queries: {},
+      alerts: {
+        severity: outcome === 'failed' ? 'high' : 'normal',
+        audit: true
+      },
+      backups: {}
+    });
+  } catch {
+    // Audit persistence must not block operational routes.
+  }
 };
 
 monitoringRouter.post('/snapshots', async (req, res, next) => {
@@ -135,6 +190,23 @@ monitoringRouter.get('/snapshots/export', async (req, res, next) => {
   }
 });
 
+monitoringRouter.get('/admin/monitoring-stats', async (_req, res, next) => {
+  try {
+    res.json(await getMonitoringTableStats());
+  } catch (error) {
+    next(error);
+  }
+});
+
+monitoringRouter.get('/security', async (req, res, next) => {
+  try {
+    const targetId = getTargetId(req.query.targetId);
+    res.json(await securityService.security(targetId));
+  } catch (error) {
+    next(error);
+  }
+});
+
 monitoringRouter.get('/targets', async (_req, res, next) => {
   try {
     res.json(await listTargets());
@@ -177,6 +249,16 @@ monitoringRouter.put('/targets/:targetId', async (req, res, next) => {
   }
 });
 
+monitoringRouter.delete('/targets/:targetId', async (req, res, next) => {
+  try {
+    const targetId = req.params.targetId;
+    await deleteTarget(targetId);
+    res.status(204).send();
+  } catch (error) {
+    next(error);
+  }
+});
+
 monitoringRouter.get('/health', async (req, res, next) => {
   try {
     const targetId = getTargetId(req.query.targetId);
@@ -209,6 +291,38 @@ monitoringRouter.get('/sessions', async (req, res, next) => {
     const targetId = getTargetId(req.query.targetId);
     res.json(await monitoringService.sessions(targetId));
   } catch (error) {
+    next(error);
+  }
+});
+
+monitoringRouter.post('/sessions/:sessionId/kill', async (req, res, next) => {
+  try {
+    const sessionId = Number.parseInt(req.params.sessionId, 10);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+      res.status(400).json({ error: 'Invalid session id' });
+      return;
+    }
+
+    const body = killSessionSchema.parse(req.body ?? {});
+    const targetId = getTargetId(body.targetId) ?? 'default';
+
+    await writeSessionKillAudit(targetId, sessionId, 'attempted');
+    const killResult = await monitoringService.killSession(sessionId, targetId);
+    await writeSessionKillAudit(
+      targetId,
+      sessionId,
+      'succeeded',
+      `login=${killResult.loginName ?? '(unknown)'}, host=${killResult.hostName ?? '(unknown)'}`
+    );
+
+    res.status(204).send();
+  } catch (error) {
+    const sessionId = Number.parseInt(req.params.sessionId, 10);
+    const targetId = getTargetId((req.body as { targetId?: string } | undefined)?.targetId) ?? 'default';
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    if (Number.isInteger(sessionId) && sessionId > 0) {
+      await writeSessionKillAudit(targetId, sessionId, 'failed', message);
+    }
     next(error);
   }
 });
@@ -256,6 +370,15 @@ monitoringRouter.get('/ai/insights', async (req, res, next) => {
     });
 
     res.json({ summary, generatedAt: new Date().toISOString() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+monitoringRouter.get('/monitoring-stats', async (_req, res, next) => {
+  try {
+    const stats = await getMonitoringTableStats();
+    res.json(stats);
   } catch (error) {
     next(error);
   }

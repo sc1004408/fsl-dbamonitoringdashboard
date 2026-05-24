@@ -32,4 +32,16 @@ if (!parsed.success) {
   throw new Error(`Invalid environment config: ${parsed.error.message}`);
 }
 
-export const env = parsed.data;
+export const env = {
+  DB_HOST: parsed.data.DB_HOST,
+  DB_PORT: parsed.data.DB_PORT,
+  DB_USER: parsed.data.DB_USER,
+  DB_PASSWORD: parsed.data.DB_PASSWORD,
+  DB_NAME: parsed.data.DB_NAME,
+  APP_PORT: process.env.APP_PORT || 5000,
+  CORS_ORIGIN: parsed.data.CORS_ORIGIN,
+  DB_TARGETS_ENCRYPTION_KEY: parsed.data.DB_TARGETS_ENCRYPTION_KEY,
+  AI_PROVIDER: parsed.data.AI_PROVIDER,
+  OPENAI_API_KEY: parsed.data.OPENAI_API_KEY,
+  OPENAI_MODEL: parsed.data.OPENAI_MODEL,
+};

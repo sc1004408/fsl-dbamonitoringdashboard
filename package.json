@@ -13,5 +13,9 @@
     "start": "npm run start -w apps/backend",
     "lint": "npm run lint -w apps/backend && npm run lint -w apps/frontend",
     "test": "npm run test -w apps/backend"
+  },
+  "dependencies": {
+    "mssql": "^12.5.4",
+    "systeminformation": "^5.31.6"
   }
 }

@@ -82,7 +82,65 @@ npm run start
 ```
 
 
-## 5) Localhost Auto-Start Deployment
+## 5) Production Deployment (Recommended: Docker Compose)
+
+Use this as the default deployment path for reproducible builds and easier operations.
+
+1. Create `.env` in repo root (see section 2).
+2. Build and start containers:
+
+```powershell
+docker compose up -d --build
+```
+
+3. Validate services:
+
+```powershell
+curl http://localhost:4000/api/ping
+```
+
+4. Open dashboard:
+
+- Frontend (with API reverse proxy): `http://localhost:8080`
+- Backend direct: `http://localhost:4000/api/ping`
+
+5. Stop services:
+
+```powershell
+docker compose down
+```
+
+Notes:
+- Frontend container proxies `/api/*` to backend container using Nginx.
+- Keep `DB_TARGETS_ENCRYPTION_KEY` set in `.env` for target storage encryption.
+
+## 6) Localhost Auto-Start Deployment (Windows)
+
+### One-Command Local Production (Recommended when Docker is unavailable)
+
+Use this to build frontend + backend and run everything on one URL.
+
+```powershell
+cd C:\Users\sc1004408\db-monitoring-ai
+deploy\windows\start-local-prod.cmd
+```
+
+- App + API: `http://localhost:4000`
+- Health check: `http://localhost:4000/api/ping`
+
+Install Start Menu/Desktop shortcuts (optional):
+
+```powershell
+cd C:\Users\sc1004408\db-monitoring-ai
+deploy\windows\install-shortcuts.cmd
+```
+
+Stop it with:
+
+```powershell
+cd C:\Users\sc1004408\db-monitoring-ai
+deploy\windows\stop-local-prod.cmd
+```
 
 ### Auto-Start (Recommended for Windows)
 
@@ -116,7 +174,7 @@ start deploy\windows\start-frontend.cmd
 - If you see port conflicts, close any old Node/serve/Vite processes and re-run the startup scripts.
 - PowerShell execution policy is not required; all launchers are `.cmd` files.
 
-## 6) AI Mode
+## 7) AI Mode
 
 - Default (`AI_PROVIDER=local`): built-in summarizer with recommendations.
 - OpenAI (`AI_PROVIDER=openai`): set `OPENAI_API_KEY` to generate model-based insights.
@@ -127,7 +185,7 @@ start deploy\windows\start-frontend.cmd
 - Use a least-privilege SQL login for monitoring.
 - Avoid exposing backend directly to internet; place behind firewall and IIS reverse proxy.
 
-## Test
+## 8) Test
 
 ```powershell
 npm run test
