@@ -1,8 +1,9 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MetricCard } from './components/MetricCard';
 import { MiniBarChart } from './components/MiniBarChart';
-import { api } from './services/api';
+import { api, setClientTabId } from './services/api';
 const defaultConnectionFields = {
     server: '',
     port: '1433',
@@ -104,6 +105,29 @@ const asLooseArray = (value) => {
     }
     return value.filter(isLooseRecord);
 };
+const normalizePleHistoryValue = (value) => {
+    if (Array.isArray(value)) {
+        return value
+            .filter(isLooseRecord)
+            .map((row) => ({
+            node_name: String(row.node_name ?? '-'),
+            page_life_expectancy: Number.isFinite(Number(row.page_life_expectancy))
+                ? Number(row.page_life_expectancy)
+                : String(row.page_life_expectancy ?? '-')
+        }));
+    }
+    if (isLooseRecord(value) && Array.isArray(value.value)) {
+        return value.value
+            .filter(isLooseRecord)
+            .map((row) => ({
+            node_name: String(row.node_name ?? '-'),
+            page_life_expectancy: Number.isFinite(Number(row.page_life_expectancy))
+                ? Number(row.page_life_expectancy)
+                : String(row.page_life_expectancy ?? '-')
+        }));
+    }
+    return [];
+};
 const toNumber = (value) => {
     const parsed = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
@@ -143,8 +167,89 @@ const shortText = (value, maxLength = 100) => {
     const text = String(value ?? '');
     return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 };
+const readAuthContext = () => {
+    const token = localStorage.getItem('token');
+    if (!token) {
+        return { id: 0, username: '', role: null };
+    }
+    try {
+        const payloadPart = token.split('.')[1];
+        if (!payloadPart) {
+            return { id: 0, username: '', role: null };
+        }
+        const normalized = payloadPart.replace(/-/g, '+').replace(/_/g, '/');
+        const decoded = JSON.parse(atob(normalized));
+        const role = decoded?.role === 'reader' ? 'reader' : decoded?.role === 'admin' ? 'admin' : null;
+        return {
+            id: Number(decoded?.sub ?? 0),
+            username: typeof decoded?.username === 'string' ? decoded.username : '',
+            role
+        };
+    }
+    catch {
+        return { id: 0, username: '', role: null };
+    }
+};
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const INACTIVITY_TIMEOUT_SECONDS = Math.floor(INACTIVITY_TIMEOUT_MS / 1000);
+const formatCountdown = (seconds) => {
+    const safe = Math.max(0, seconds);
+    const mins = Math.floor(safe / 60);
+    const secs = safe % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+};
 export const App = () => {
+    const navigate = useNavigate();
+    const inactivityTimerRef = useRef(null);
+    const inactivityDeadlineRef = useRef(null);
+    const countdownIntervalRef = useRef(null);
+    const tabIdRef = useRef('');
+    const userMenuRef = useRef(null);
+    const authContext = useMemo(() => readAuthContext(), []);
     const [data, setData] = useState(initialState);
+    const [adminUsers, setAdminUsers] = useState([]);
+    const [adminLoading, setAdminLoading] = useState(false);
+    const [showAdminConsole, setShowAdminConsole] = useState(false);
+    const [showCreateUserForm, setShowCreateUserForm] = useState(false);
+    const [showAdminUsers, setShowAdminUsers] = useState(false);
+    const [adminUsersLoaded, setAdminUsersLoaded] = useState(false);
+    const [adminMessage, setAdminMessage] = useState('');
+    const [inactivityRemainingSeconds, setInactivityRemainingSeconds] = useState(INACTIVITY_TIMEOUT_SECONDS);
+    const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+    const [newUsername, setNewUsername] = useState('');
+    const [newUserPassword, setNewUserPassword] = useState('');
+    const [newUserRole, setNewUserRole] = useState('reader');
+    const getTabId = () => {
+        if (tabIdRef.current) {
+            return tabIdRef.current;
+        }
+        const storageKey = 'db-monitoring-tab-id';
+        let tabId = sessionStorage.getItem(storageKey);
+        if (!tabId) {
+            tabId = typeof crypto.randomUUID === 'function'
+                ? crypto.randomUUID()
+                : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+            sessionStorage.setItem(storageKey, tabId);
+        }
+        tabIdRef.current = tabId;
+        setClientTabId(tabId);
+        return tabId;
+    };
+    const handleLogout = useCallback(() => {
+        const tabId = tabIdRef.current || sessionStorage.getItem('db-monitoring-tab-id');
+        if (tabId) {
+            void api.presenceClose(tabId, true);
+        }
+        localStorage.removeItem('token');
+        navigate('/login');
+    }, [navigate]);
+    const handleUserMenuToggle = () => {
+        setIsUserMenuOpen((current) => !current);
+    };
+    const handleUserMenuLogout = () => {
+        setIsUserMenuOpen(false);
+        handleLogout();
+    };
     const [targets, setTargets] = useState([]);
     const [selectedTargetId, setSelectedTargetId] = useState('');
     const [showTopicPane, setShowTopicPane] = useState(false);
@@ -183,6 +288,7 @@ export const App = () => {
     const [showSuccessBackups, setShowSuccessBackups] = useState(false);
     const [securityData, setSecurityData] = useState(null);
     const [securityLoading, setSecurityLoading] = useState(false);
+    const [exportMenuContext, setExportMenuContext] = useState('none');
     const firstFieldRef = useRef(null);
     const selectedTarget = useMemo(() => targets.find((target) => target.id === selectedTargetId) ?? null, [targets, selectedTargetId]);
     const loadHomeHealth = async (targetList) => {
@@ -311,6 +417,24 @@ export const App = () => {
             setMonitoringStats(null);
         }
     };
+    const loadAdminUsers = async () => {
+        if (authContext.role !== 'admin') {
+            return;
+        }
+        setAdminLoading(true);
+        try {
+            const users = await api.listUsers();
+            setAdminUsers(users);
+            setAdminUsersLoaded(true);
+        }
+        catch {
+            setAdminMessage('Unable to load users.');
+            setAdminUsersLoaded(false);
+        }
+        finally {
+            setAdminLoading(false);
+        }
+    };
     useEffect(() => {
         let active = true;
         const loadTargets = async () => {
@@ -331,6 +455,96 @@ export const App = () => {
         void loadTargets();
         return () => {
             active = false;
+        };
+    }, []);
+    useEffect(() => {
+        if (authContext.id <= 0) {
+            return;
+        }
+        const tabId = getTabId();
+        const sendHeartbeat = () => {
+            void api.presenceHeartbeat(tabId);
+        };
+        sendHeartbeat();
+        const intervalId = window.setInterval(sendHeartbeat, 30 * 1000);
+        const handlePageHide = () => {
+            void api.presenceClose(tabId, true);
+        };
+        window.addEventListener('pagehide', handlePageHide);
+        window.addEventListener('beforeunload', handlePageHide);
+        return () => {
+            window.clearInterval(intervalId);
+            window.removeEventListener('pagehide', handlePageHide);
+            window.removeEventListener('beforeunload', handlePageHide);
+            void api.presenceClose(tabId, true);
+        };
+    }, [authContext.id]);
+    useEffect(() => {
+        const handleDocumentClick = (event) => {
+            const target = event.target;
+            if (!userMenuRef.current || !target) {
+                return;
+            }
+            if (!userMenuRef.current.contains(target)) {
+                setIsUserMenuOpen(false);
+            }
+        };
+        document.addEventListener('click', handleDocumentClick);
+        return () => {
+            document.removeEventListener('click', handleDocumentClick);
+        };
+    }, []);
+    useEffect(() => {
+        const updateCountdown = () => {
+            const deadline = inactivityDeadlineRef.current;
+            if (!deadline) {
+                setInactivityRemainingSeconds(INACTIVITY_TIMEOUT_SECONDS);
+                return;
+            }
+            const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+            setInactivityRemainingSeconds(remaining);
+        };
+        const resetTimer = () => {
+            if (inactivityTimerRef.current) {
+                window.clearTimeout(inactivityTimerRef.current);
+            }
+            inactivityDeadlineRef.current = Date.now() + INACTIVITY_TIMEOUT_MS;
+            updateCountdown();
+            inactivityTimerRef.current = window.setTimeout(() => {
+                handleLogout();
+            }, INACTIVITY_TIMEOUT_MS);
+        };
+        const events = ['click', 'keydown', 'mousemove', 'scroll', 'touchstart'];
+        events.forEach((eventName) => {
+            document.addEventListener(eventName, resetTimer, { passive: true });
+        });
+        resetTimer();
+        countdownIntervalRef.current = window.setInterval(updateCountdown, 1000);
+        return () => {
+            if (inactivityTimerRef.current) {
+                window.clearTimeout(inactivityTimerRef.current);
+            }
+            if (countdownIntervalRef.current) {
+                window.clearInterval(countdownIntervalRef.current);
+            }
+            events.forEach((eventName) => {
+                document.removeEventListener(eventName, resetTimer);
+            });
+        };
+    }, [handleLogout]);
+    useEffect(() => {
+        const handleDocumentClick = (event) => {
+            const target = event.target;
+            if (!target) {
+                return;
+            }
+            if (!target.closest('.export-menu-wrap')) {
+                setExportMenuContext('none');
+            }
+        };
+        document.addEventListener('click', handleDocumentClick);
+        return () => {
+            document.removeEventListener('click', handleDocumentClick);
         };
     }, []);
     useEffect(() => {
@@ -481,10 +695,13 @@ export const App = () => {
         if (!selectedTargetId)
             return;
         try {
+            const pleSnapshotRows = await api.ple(selectedTargetId);
+            setPleData(pleSnapshotRows);
             await api.saveSnapshot({
                 targetId: selectedTargetId,
                 health: data.health,
                 performance: data.performance,
+                ple: pleSnapshotRows,
                 storage: data.storage,
                 sessions: data.sessions,
                 queries: data.queries,
@@ -533,7 +750,9 @@ export const App = () => {
             setTopicHistory(response.items.map((row) => ({
                 id: row.id,
                 capturedAt: row.capturedAt,
-                value: row[topic]
+                value: topic === 'ple'
+                    ? normalizePleHistoryValue(row.ple)
+                    : row[topic]
             })));
             setHistoryTotal(response.total);
             setHistoryOffset(response.offset);
@@ -656,6 +875,154 @@ export const App = () => {
         }
         catch {
             setTargetMessage('Unable to export snapshot history CSV.');
+        }
+    };
+    const exportSnapshotsExcel = async () => {
+        try {
+            const blob = await api.exportSnapshots({
+                targetId: selectedTargetId || undefined,
+                from: historyFrom || undefined,
+                to: historyTo || undefined,
+                format: 'excel'
+            });
+            downloadBlob(blob, `${exportFilenamePrefix}.xlsx`);
+        }
+        catch {
+            setTargetMessage('Unable to export snapshot history Excel.');
+        }
+    };
+    const exportSnapshotsByFormat = async (format, includeHistoryRange) => {
+        try {
+            const blob = await api.exportSnapshots({
+                targetId: selectedTargetId || undefined,
+                from: includeHistoryRange ? (historyFrom || undefined) : undefined,
+                to: includeHistoryRange ? (historyTo || undefined) : undefined,
+                format
+            });
+            const extension = format === 'excel' ? 'xlsx' : format;
+            downloadBlob(blob, `${exportFilenamePrefix}.${extension}`);
+            setExportMenuContext('none');
+        }
+        catch {
+            setTargetMessage(`Unable to export snapshot history ${format.toUpperCase()}.`);
+        }
+    };
+    const renderExportMenu = (context, includeHistoryRange) => {
+        const isOpen = exportMenuContext === context;
+        return (_jsxs("div", { className: "export-menu-wrap", style: { position: 'relative', display: 'inline-block' }, children: [_jsx("button", { type: "button", onClick: (event) => {
+                        event.stopPropagation();
+                        setExportMenuContext((current) => current === context ? 'none' : context);
+                    }, disabled: historyLoading, children: "Export" }), isOpen && (_jsxs("div", { style: {
+                        position: 'absolute',
+                        top: 'calc(100% + 4px)',
+                        right: 0,
+                        minWidth: 140,
+                        background: '#fff',
+                        border: '1px solid #d0d5dd',
+                        borderRadius: 8,
+                        boxShadow: '0 8px 24px rgba(15, 23, 42, 0.15)',
+                        padding: 6,
+                        zIndex: 15
+                    }, children: [_jsx("button", { type: "button", style: { width: '100%', textAlign: 'left', marginBottom: 4 }, onClick: () => void exportSnapshotsByFormat('csv', includeHistoryRange), children: "CSV" }), _jsx("button", { type: "button", style: { width: '100%', textAlign: 'left', marginBottom: 4 }, onClick: () => void exportSnapshotsByFormat('pdf', includeHistoryRange), children: "PDF" }), _jsx("button", { type: "button", style: { width: '100%', textAlign: 'left' }, onClick: () => void exportSnapshotsByFormat('excel', includeHistoryRange), children: "EXCEL" })] }))] }));
+    };
+    const exportSnapshotsPdf = async () => {
+        try {
+            const blob = await api.exportSnapshots({
+                targetId: selectedTargetId || undefined,
+                from: historyFrom || undefined,
+                to: historyTo || undefined,
+                format: 'pdf'
+            });
+            downloadBlob(blob, `${exportFilenamePrefix}.pdf`);
+        }
+        catch {
+            setTargetMessage('Unable to export snapshot history PDF.');
+        }
+    };
+    const handleCreateUser = async (event) => {
+        event.preventDefault();
+        if (!newUsername.trim() || !newUserPassword) {
+            setAdminMessage('Enter username and password to create user.');
+            return;
+        }
+        setAdminLoading(true);
+        setAdminMessage('');
+        try {
+            await api.createUser(newUsername.trim(), newUserPassword, newUserRole);
+            setNewUsername('');
+            setNewUserPassword('');
+            setNewUserRole('reader');
+            if (showAdminUsers) {
+                await loadAdminUsers();
+                setAdminMessage('User created successfully.');
+            }
+            else {
+                setAdminUsersLoaded(false);
+                setAdminMessage('User created. Click Load Principals to view the updated list.');
+            }
+        }
+        catch {
+            setAdminMessage('Unable to create user.');
+        }
+        finally {
+            setAdminLoading(false);
+        }
+    };
+    const resetCreateUserForm = () => {
+        setNewUsername('');
+        setNewUserPassword('');
+        setNewUserRole('reader');
+    };
+    const handleToggleCreateUserForm = () => {
+        const nextVisible = !showCreateUserForm;
+        setShowCreateUserForm(nextVisible);
+        if (!nextVisible) {
+            resetCreateUserForm();
+        }
+    };
+    const handleToggleAdminUsers = async () => {
+        const nextVisible = !showAdminUsers;
+        setShowAdminUsers(nextVisible);
+        if (nextVisible && !adminUsersLoaded) {
+            setAdminMessage('');
+            await loadAdminUsers();
+        }
+    };
+    const handleToggleAdminConsole = () => {
+        const nextVisible = !showAdminConsole;
+        setShowAdminConsole(nextVisible);
+        if (!nextVisible) {
+            setShowCreateUserForm(false);
+            setShowAdminUsers(false);
+            setAdminMessage('');
+            resetCreateUserForm();
+        }
+    };
+    const handleDeleteUser = async (userId, username) => {
+        if (username === authContext.username) {
+            setAdminMessage('You cannot delete your own account.');
+            return;
+        }
+        if (!window.confirm(`Delete user ${username}?`)) {
+            return;
+        }
+        setAdminLoading(true);
+        setAdminMessage('');
+        try {
+            await api.deleteUser(userId);
+            if (showAdminUsers) {
+                await loadAdminUsers();
+            }
+            else {
+                setAdminUsersLoaded(false);
+            }
+            setAdminMessage('User deleted successfully.');
+        }
+        catch {
+            setAdminMessage('Unable to delete user.');
+        }
+        finally {
+            setAdminLoading(false);
         }
     };
     const copySnapshotJson = async (snapshot) => {
@@ -871,18 +1238,18 @@ export const App = () => {
     };
     // Hide AI Mode topic by not including it in the topicItems array
     const topicItems = [
-        { id: 'health', label: 'Instance Health Overview' },
-        { id: 'cpuMemory', label: 'Host Resource Utilization' },
-        { id: 'performance', label: 'Wait Statistics & Requests' },
-        { id: 'storage', label: 'Database Storage Capacity' },
-        { id: 'sessions', label: 'Session Activity & Control' },
-        { id: 'queries', label: 'Query Performance Analysis' },
-        { id: 'alerts', label: 'Operational Alerts & Incidents' },
-        { id: 'backups', label: 'Backup Compliance Status' },
-        { id: 'ple', label: 'Buffer Cache PLE Analysis' },
-        { id: 'suggestions', label: 'Recommendations' },
-        { id: 'security', label: 'Security & Access Control' },
-        { id: 'history', label: 'Monitoring Snapshot Audit' }
+        { id: 'health', label: 'Instance Health Check', code: 'HLT' },
+        { id: 'cpuMemory', label: 'Host CPU & Memory', code: 'CPU' },
+        { id: 'performance', label: 'Waits, Latches & Requests', code: 'WTR' },
+        { id: 'storage', label: 'Data & Log Capacity', code: 'STG' },
+        { id: 'sessions', label: 'SPID Activity & Kill Control', code: 'SES' },
+        { id: 'queries', label: 'Top SQL & Execution Trends', code: 'SQL' },
+        { id: 'alerts', label: 'Incidents & Alert Conditions', code: 'ALT' },
+        { id: 'backups', label: 'Backup & Recovery SLA', code: 'BKP' },
+        { id: 'ple', label: 'Buffer Cache Health (PLE)', code: 'PLE' },
+        { id: 'suggestions', label: 'Index & Tuning Suggestions', code: 'TUN' },
+        { id: 'security', label: 'Principals, Roles & Permissions', code: 'SEC' },
+        { id: 'history', label: 'Snapshot Audit Trail', code: 'AUD' }
     ];
     // Fetch topic-specific data when selected topic changes.
     useEffect(() => {
@@ -917,11 +1284,11 @@ export const App = () => {
             await loadTopicHistory(showHistoryView.topic, 0);
         }
     };
-    return (_jsxs("main", { className: "shell", children: [_jsxs("header", { className: "hero", children: [_jsx("p", { className: "tag", children: "Enterprise SQL Server Monitoring for DBAs" }), _jsx("h1", { children: "Professional SQL Server DBA Operations Console" }), _jsxs("div", { className: "hero-row", children: [_jsxs("span", { className: "status", children: ["Status: ", statusLabel] }), _jsx("button", { onClick: () => void refreshAll(selectedTargetId), disabled: !selectedTargetId, children: "Refresh Snapshot" }), _jsx("button", { onClick: () => void handleSaveSnapshot(), disabled: !selectedTargetId, title: "Save current dashboard data to DBA_Monitoring database", children: "Save Snapshot" })] }), _jsxs("section", { className: "target-panel", children: [_jsxs("div", { className: "target-row", children: [_jsx("label", { htmlFor: "target-select", children: "DB Server" }), _jsx("select", { id: "target-select", value: selectedTargetId, onChange: (event) => void handleSelectTarget(event.target.value), children: targets.map((target) => (_jsx("option", { value: target.id, children: target.name }, target.id))) }), _jsx("button", { type: "button", onClick: () => setShowTopicPane(false), style: { marginRight: 8 }, children: "Home" }), _jsx("button", { type: "button", onClick: openAddForm, children: "Add Target" }), _jsx("button", { type: "button", onClick: openEditForm, disabled: !selectedTargetId, children: "Edit Target" }), _jsx("button", { type: "button", onClick: () => void handleRemoveTarget(), disabled: !selectedTargetId || selectedTargetId === 'default', style: { marginLeft: 8, color: 'red' }, children: "Remove Target" })] }), formMode && (_jsxs("form", { className: "target-add-row", onSubmit: (event) => void handleSubmitConnectionForm(event), children: [_jsx("input", { ref: firstFieldRef, type: "text", placeholder: "Server label", value: formTargetName, onChange: (event) => setFormTargetName(event.target.value) }), _jsx("input", { type: "text", placeholder: "Server host", value: formConnection.server, onChange: (event) => setFormConnection((current) => ({ ...current, server: event.target.value })) }), _jsx("input", { type: "text", placeholder: "Port", value: formConnection.port, onChange: (event) => setFormConnection((current) => ({ ...current, port: event.target.value })) }), _jsx("input", { type: "text", placeholder: "Database", value: formConnection.database, onChange: (event) => setFormConnection((current) => ({ ...current, database: event.target.value })) }), _jsx("input", { type: "text", placeholder: "User ID", value: formConnection.userId, onChange: (event) => setFormConnection((current) => ({ ...current, userId: event.target.value })) }), _jsx("input", { type: "password", placeholder: formMode === 'edit' ? 'Password (required if connection changed)' : 'Password', value: formConnection.password, onChange: (event) => setFormConnection((current) => ({ ...current, password: event.target.value })) }), _jsxs("label", { className: "target-checkbox", children: [_jsx("input", { type: "checkbox", checked: formConnection.encrypt, onChange: (event) => setFormConnection((current) => ({ ...current, encrypt: event.target.checked })) }), "Encrypt"] }), _jsxs("label", { className: "target-checkbox", children: [_jsx("input", { type: "checkbox", checked: formConnection.trustServerCertificate, onChange: (event) => setFormConnection((current) => ({ ...current, trustServerCertificate: event.target.checked })) }), "Trust Server Certificate"] }), _jsx("button", { type: "submit", children: formMode === 'add' ? 'Save Target' : 'Save Changes' }), _jsx("button", { type: "button", onClick: closeForm, children: "Cancel" })] })), selectedTarget && _jsxs("p", { className: "target-meta", children: ["Active: ", selectedTarget.connectionStringMasked] }), targetMessage && _jsx("p", { className: "target-message", children: targetMessage })] })] }), !showTopicPane && (_jsxs("section", { className: "ai-panel", style: { marginTop: 0 }, children: [_jsx("h2", { children: "Home: SQL Server Instance Health Overview" }), _jsx("p", { children: "Select a DB server to open the full topic pane and detailed monitoring reports." }), _jsx("div", { className: "metric-scroll", style: { marginTop: 8, marginBottom: 8 }, children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Server List Rows" }), _jsx("th", { children: "Snapshot Header Rows" }), _jsx("th", { children: "Snapshot Detail Rows" }), _jsx("th", { children: "Legacy Snapshot Rows" }), _jsx("th", { children: "Oldest Snapshot" }), _jsx("th", { children: "Newest Snapshot" }), _jsx("th", { children: "Retention (days)" })] }) }), _jsx("tbody", { children: monitoringStats ? (_jsxs("tr", { children: [_jsx("td", { children: formatNumber(monitoringStats.serverListCount) }), _jsx("td", { children: formatNumber(monitoringStats.snapshotHeaderCount) }), _jsx("td", { children: formatNumber(monitoringStats.snapshotDetailCount) }), _jsx("td", { children: formatNumber(monitoringStats.dashboardSnapshotCount) }), _jsx("td", { children: monitoringStats.oldestSnapshotAt ? new Date(monitoringStats.oldestSnapshotAt).toLocaleString() : '-' }), _jsx("td", { children: monitoringStats.newestSnapshotAt ? new Date(monitoringStats.newestSnapshotAt).toLocaleString() : '-' }), _jsxs("td", { children: [formatNumber(monitoringStats.retentionDays), monitoringStats.error && _jsx("span", { className: "status-warn", title: monitoringStats.error, children: " \u0393\u00DC\u00E1 DB unavailable" })] })] })) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "Loading monitoring table stats\u0393\u00C7\u00AA" }) })) })] }) }), homeHealthLoading && _jsx("p", { children: "Loading server health overview..." }), _jsx("div", { className: "metric-scroll", style: { marginTop: 8 }, children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "DB Server" }), _jsx("th", { children: "Status" }), _jsx("th", { children: "Instance Name" }), _jsx("th", { children: "Uptime (minutes)" }), _jsx("th", { children: "CPU (%)" }), _jsx("th", { children: "Memory Usage" }), _jsx("th", { children: "Checked At" }), _jsx("th", { children: "Open Reports" })] }) }), _jsx("tbody", { children: targets.length > 0 ? targets.map((target) => {
+    return (_jsxs("main", { className: "shell", children: [_jsxs("header", { className: "hero", children: [_jsx("p", { className: "tag", children: "Enterprise SQL Server Monitoring for DBAs" }), _jsx("h1", { children: "SQL Server DBA Operations Console" }), _jsxs("div", { className: "hero-row", children: [_jsxs("span", { className: "status", children: ["Status: ", statusLabel] }), _jsxs("span", { className: "status idle-timer", children: ["Auto logout in ", formatCountdown(inactivityRemainingSeconds)] }), _jsx("button", { onClick: () => void refreshAll(selectedTargetId), disabled: !selectedTargetId, children: "Refresh Telemetry" }), _jsx("button", { onClick: () => void handleSaveSnapshot(), disabled: !selectedTargetId, title: "Persist current telemetry set to DBA_Monitoring", children: "Persist Snapshot" }), authContext.role === 'admin' && (_jsx("button", { type: "button", onClick: handleToggleAdminConsole, children: showAdminConsole ? 'Hide Principals Console' : 'Open Principals Console' })), _jsxs("div", { className: "user-menu", ref: userMenuRef, children: [_jsxs("button", { type: "button", className: "user-menu-trigger", onClick: handleUserMenuToggle, children: [_jsx("span", { className: "user-icon", "aria-hidden": "true", children: _jsx("svg", { viewBox: "0 0 24 24", className: "user-icon-svg", focusable: "false", "aria-hidden": "true", children: _jsx("path", { fill: "currentColor", d: "M12 12a4.5 4.5 0 1 0-4.5-4.5A4.5 4.5 0 0 0 12 12Zm0 2.25c-3.38 0-6.75 1.69-6.75 5.06a.94.94 0 0 0 .94.94h11.62a.94.94 0 0 0 .94-.94c0-3.37-3.37-5.06-6.75-5.06Z" }) }) }), _jsx("span", { className: "user-name", children: authContext.username || 'DBA User' }), _jsx("span", { className: "user-caret", "aria-hidden": "true", children: "\u25BE" })] }), isUserMenuOpen && (_jsx("div", { className: "user-menu-dropdown", children: _jsx("button", { type: "button", className: "user-menu-item", onClick: handleUserMenuLogout, children: "Logout" }) }))] })] }), _jsxs("section", { className: "target-panel", children: [_jsxs("div", { className: "target-row", children: [_jsx("label", { htmlFor: "target-select", children: "SQL Instance" }), _jsx("select", { id: "target-select", value: selectedTargetId, onChange: (event) => void handleSelectTarget(event.target.value), children: targets.map((target) => (_jsx("option", { value: target.id, children: target.name }, target.id))) }), _jsx("button", { type: "button", onClick: () => setShowTopicPane(false), style: { marginRight: 8 }, children: "Executive View" }), _jsx("button", { type: "button", onClick: openAddForm, children: "Register Instance" }), _jsx("button", { type: "button", onClick: openEditForm, disabled: !selectedTargetId, children: "Edit Instance" }), _jsx("button", { type: "button", onClick: () => void handleRemoveTarget(), disabled: !selectedTargetId || selectedTargetId === 'default', style: { marginLeft: 8, color: 'red' }, children: "Decommission Instance" })] }), formMode && (_jsxs("form", { className: "target-add-row", onSubmit: (event) => void handleSubmitConnectionForm(event), children: [_jsx("input", { ref: firstFieldRef, type: "text", placeholder: "Server label", value: formTargetName, onChange: (event) => setFormTargetName(event.target.value) }), _jsx("input", { type: "text", placeholder: "Server host", value: formConnection.server, onChange: (event) => setFormConnection((current) => ({ ...current, server: event.target.value })) }), _jsx("input", { type: "text", placeholder: "Port", value: formConnection.port, onChange: (event) => setFormConnection((current) => ({ ...current, port: event.target.value })) }), _jsx("input", { type: "text", placeholder: "Database", value: formConnection.database, onChange: (event) => setFormConnection((current) => ({ ...current, database: event.target.value })) }), _jsx("input", { type: "text", placeholder: "User ID", value: formConnection.userId, onChange: (event) => setFormConnection((current) => ({ ...current, userId: event.target.value })) }), _jsx("input", { type: "password", placeholder: formMode === 'edit' ? 'Password (required if connection changed)' : 'Password', value: formConnection.password, onChange: (event) => setFormConnection((current) => ({ ...current, password: event.target.value })) }), _jsxs("label", { className: "target-checkbox", children: [_jsx("input", { type: "checkbox", checked: formConnection.encrypt, onChange: (event) => setFormConnection((current) => ({ ...current, encrypt: event.target.checked })) }), "Encrypt"] }), _jsxs("label", { className: "target-checkbox", children: [_jsx("input", { type: "checkbox", checked: formConnection.trustServerCertificate, onChange: (event) => setFormConnection((current) => ({ ...current, trustServerCertificate: event.target.checked })) }), "Trust Server Certificate"] }), _jsx("button", { type: "submit", children: formMode === 'add' ? 'Save Target' : 'Save Changes' }), _jsx("button", { type: "button", onClick: closeForm, children: "Cancel" })] })), selectedTarget && _jsxs("p", { className: "target-meta", children: ["Active: ", selectedTarget.connectionStringMasked] }), targetMessage && _jsx("p", { className: "target-message", children: targetMessage })] }), authContext.role === 'admin' && showAdminConsole && (_jsxs("section", { className: "target-panel admin-console", style: { marginTop: 10 }, children: [_jsx("h3", { style: { marginTop: 0 }, children: "DBA Administration Console: Principals" }), _jsxs("div", { className: "admin-actions-row", children: [_jsx("button", { type: "button", onClick: handleToggleCreateUserForm, disabled: adminLoading, children: showCreateUserForm ? 'Hide Create User' : 'Create User' }), _jsx("button", { type: "button", onClick: () => void handleToggleAdminUsers(), disabled: adminLoading, children: showAdminUsers ? 'Hide Principals' : 'Load Principals' }), showAdminUsers && (_jsx("button", { type: "button", onClick: () => void loadAdminUsers(), disabled: adminLoading, children: "Refresh Principals" }))] }), showCreateUserForm && (_jsxs("form", { className: "target-add-row admin-form", onSubmit: (event) => void handleCreateUser(event), children: [_jsx("input", { type: "text", placeholder: "Login name", value: newUsername, onChange: (event) => setNewUsername(event.target.value) }), _jsx("input", { type: "password", placeholder: "Password", value: newUserPassword, onChange: (event) => setNewUserPassword(event.target.value) }), _jsxs("select", { value: newUserRole, onChange: (event) => setNewUserRole(event.target.value), children: [_jsx("option", { value: "reader", children: "reader" }), _jsx("option", { value: "admin", children: "admin" })] }), _jsx("button", { type: "submit", disabled: adminLoading, children: adminLoading ? 'Saving...' : 'Create Principal' }), _jsx("button", { type: "button", onClick: resetCreateUserForm, disabled: adminLoading, children: "Reset Fields" })] })), adminMessage && _jsx("p", { className: "target-message", children: adminMessage }), !showAdminUsers && _jsx("p", { className: "target-message", children: "Principal list is hidden. Click Load Principals to populate it." }), showAdminUsers && (_jsx("div", { className: "metric-scroll admin-user-table", style: { marginTop: 8 }, children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Principal ID" }), _jsx("th", { children: "Login Name" }), _jsx("th", { children: "Access Role" }), _jsx("th", { children: "Session Status" }), _jsx("th", { children: "Open Tabs" }), _jsx("th", { children: "Last Active" }), _jsx("th", { children: "Created (UTC)" }), _jsx("th", { children: "Operation" })] }) }), _jsx("tbody", { children: adminUsers.length > 0 ? adminUsers.map((user) => (_jsxs("tr", { children: [_jsx("td", { children: user.id }), _jsx("td", { children: user.username }), _jsx("td", { children: user.role }), _jsx("td", { children: _jsx("span", { className: user.is_active ? 'status-ok' : 'status-warn', children: user.is_active ? 'Active' : 'Offline' }) }), _jsx("td", { children: user.active_tab_count ?? 0 }), _jsx("td", { children: user.last_active_at ? new Date(user.last_active_at).toLocaleString() : '-' }), _jsx("td", { children: user.created_at ? new Date(user.created_at).toLocaleString() : '-' }), _jsx("td", { children: _jsx("button", { type: "button", onClick: () => void handleDeleteUser(user.id, user.username), disabled: adminLoading || user.username === authContext.username, className: "btn-danger", children: "Drop" }) })] }, user.id))) : (_jsx("tr", { children: _jsx("td", { colSpan: 8, children: adminLoading ? 'Loading principals...' : 'No principals found' }) })) })] }) }))] }))] }), !showTopicPane && (_jsxs("section", { className: "ai-panel", style: { marginTop: 0 }, children: [_jsx("h2", { children: "Executive Overview: SQL Estate Health" }), _jsx("p", { children: "Select an instance to open topic-specific DBA analytics and operational controls." }), _jsx("div", { className: "metric-scroll", style: { marginTop: 8, marginBottom: 8 }, children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Server List Rows" }), _jsx("th", { children: "Snapshot Header Rows" }), _jsx("th", { children: "Snapshot Detail Rows" }), _jsx("th", { children: "Legacy Snapshot Rows" }), _jsx("th", { children: "Oldest Snapshot" }), _jsx("th", { children: "Newest Snapshot" }), _jsx("th", { children: "Retention (days)" })] }) }), _jsx("tbody", { children: monitoringStats ? (_jsxs("tr", { children: [_jsx("td", { children: formatNumber(monitoringStats.serverListCount) }), _jsx("td", { children: formatNumber(monitoringStats.snapshotHeaderCount) }), _jsx("td", { children: formatNumber(monitoringStats.snapshotDetailCount) }), _jsx("td", { children: formatNumber(monitoringStats.dashboardSnapshotCount) }), _jsx("td", { children: monitoringStats.oldestSnapshotAt ? new Date(monitoringStats.oldestSnapshotAt).toLocaleString() : '-' }), _jsx("td", { children: monitoringStats.newestSnapshotAt ? new Date(monitoringStats.newestSnapshotAt).toLocaleString() : '-' }), _jsxs("td", { children: [formatNumber(monitoringStats.retentionDays), monitoringStats.error && _jsx("span", { className: "status-warn", title: monitoringStats.error, children: " - repository unavailable" })] })] })) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "Loading monitoring table stats\u0393\u00C7\u00AA" }) })) })] }) }), homeHealthLoading && _jsx("p", { children: "Loading SQL instance telemetry..." }), _jsx("div", { className: "metric-scroll", style: { marginTop: 8 }, children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "SQL Instance" }), _jsx("th", { children: "Availability" }), _jsx("th", { children: "Host Name" }), _jsx("th", { children: "Instance Uptime (min)" }), _jsx("th", { children: "Host CPU %" }), _jsx("th", { children: "Memory Footprint" }), _jsx("th", { children: "Last Sample" }), _jsx("th", { children: "Open Console" })] }) }), _jsx("tbody", { children: targets.length > 0 ? targets.map((target) => {
                                         const homeHealth = homeHealthByTargetId[target.id];
                                         const homeMemory = homeHealth && isLooseRecord(homeHealth.memory) ? homeHealth.memory : null;
-                                        return (_jsxs("tr", { children: [_jsx("td", { children: target.name }), _jsx("td", { children: String(homeHealth?.status ?? 'unknown') }), _jsx("td", { children: String(homeHealth?.serverName ?? '-') }), _jsx("td", { children: formatNumber(homeHealth?.uptimeMinutes ?? 0) }), _jsx("td", { children: formatNumber(homeHealth?.cpuUsagePercent ?? 0) }), _jsx("td", { children: homeMemory ? `${formatBytes(homeMemory.used)} / ${formatBytes(homeMemory.total)}` : '-' }), _jsx("td", { children: homeHealth?.checkedAt ? new Date(String(homeHealth.checkedAt)).toLocaleString() : '-' }), _jsx("td", { children: _jsx("button", { type: "button", onClick: () => void handleSelectTarget(target.id), children: "Open Report" }) })] }, target.id));
-                                    }) : (_jsx("tr", { children: _jsx("td", { colSpan: 8, children: "No database targets are configured" }) })) })] }) })] })), showTopicPane && (_jsxs("section", { className: "topic-layout", children: [_jsxs("aside", { className: "topic-sidebar", children: [_jsx("h3", { children: "Monitoring Topics" }), _jsx("div", { className: "topic-list", children: topicItems.map((topic) => (_jsx("button", { type: "button", className: `topic-button${selectedTopic === topic.id ? ' active' : ''}`, onClick: () => handleSelectTopic(topic.id), children: topic.label }, topic.id))) })] }), _jsxs("div", { className: "topic-content", children: [selectedTopic && !showHistoryView.topic && (_jsx("div", { className: "snapshot-actions", style: { justifyContent: 'flex-end', marginBottom: 8 }, children: _jsx("button", { type: "button", onClick: () => void refreshCurrentTopic(), disabled: !selectedTargetId || loading || historyLoading || securityLoading, children: loading || securityLoading ? 'Refreshing Data...' : 'Refresh Topic Data' }) })), !selectedTopic && (_jsxs("section", { className: "ai-panel topic-placeholder", children: [_jsx("h2", { children: "Select a monitoring domain" }), _jsx("p", { children: "Click any topic on the left side to load that report on the right." })] })), showHistoryView.topic && (_jsxs("section", { className: "ai-panel", style: { marginTop: 0, position: 'relative' }, children: [_jsx("button", { className: "history-btn history-back-btn", onClick: closeHistoryView, children: "Back to Live Data" }), _jsxs("div", { className: "ai-title-row", children: [_jsxs("h2", { children: ["History View: ", showHistoryView.topic.charAt(0).toUpperCase() + showHistoryView.topic.slice(1)] }), _jsxs("div", { className: "snapshot-actions", children: [_jsx("input", { type: "datetime-local", value: historyFrom, onChange: (e) => setHistoryFrom(e.target.value) }), _jsx("input", { type: "datetime-local", value: historyTo, onChange: (e) => setHistoryTo(e.target.value) }), _jsx("button", { onClick: startHistorySearch, disabled: historyLoading, children: historyLoading ? 'Loading...' : 'Load History' })] })] }), _jsxs("table", { className: "backup-table", style: { marginTop: 12 }, children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Snapshot ID" }), _jsx("th", { children: "Captured Timestamp" }), _jsxs("th", { children: [showHistoryView.topic.charAt(0).toUpperCase() + showHistoryView.topic.slice(1), " Metrics"] })] }) }), _jsx("tbody", { children: topicHistory.length > 0 ? (topicHistory.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.id }), _jsx("td", { children: new Date(row.capturedAt).toLocaleString() }), _jsx("td", { children: _jsx("pre", { style: { maxWidth: 700, maxHeight: 220, overflow: 'auto', margin: 0 }, children: JSON.stringify(row.value, null, 2) }) })] }, row.id)))) : (_jsx("tr", { children: _jsx("td", { colSpan: 3, children: "No history data found for selected range." }) })) })] }), _jsxs("div", { className: "history-pagination", children: [_jsx("button", { type: "button", disabled: !canGoPrev || historyLoading, onClick: () => showHistoryView.topic && void loadTopicHistory(showHistoryView.topic, Math.max(0, historyOffset - historyLimit)), children: "Previous" }), _jsxs("span", { children: ["Showing ", topicHistory.length === 0 ? 0 : historyOffset + 1, "-", historyOffset + topicHistory.length, " of ", historyTotal] }), _jsx("button", { type: "button", disabled: !canGoNext || historyLoading, onClick: () => showHistoryView.topic && void loadTopicHistory(showHistoryView.topic, historyOffset + historyLimit), children: "Next" })] })] })), selectedTopic === 'health' && !showHistoryView.topic && (_jsxs(MetricCard, { title: "Instance Health Overview", titleProps: { title: 'SQL Server uptime, version, and start time.' }, children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('health'), children: "History View" }), _jsx("table", { className: "backup-table compact-table", children: _jsx("tbody", { children: healthRows.map((row) => (_jsxs("tr", { children: [_jsx("th", { children: row.label }), _jsx("td", { children: row.value })] }, row.label))) }) }), _jsxs("div", { className: "metric-bars", "aria-label": "Health Signals", children: [_jsx("h4", { children: "Operational Health Indicators" }), _jsx(MiniBarChart, { data: [
+                                        return (_jsxs("tr", { children: [_jsx("td", { children: target.name }), _jsx("td", { children: String(homeHealth?.status ?? 'unknown') }), _jsx("td", { children: String(homeHealth?.serverName ?? '-') }), _jsx("td", { children: formatNumber(homeHealth?.uptimeMinutes ?? 0) }), _jsx("td", { children: formatNumber(homeHealth?.cpuUsagePercent ?? 0) }), _jsx("td", { children: homeMemory ? `${formatBytes(homeMemory.used)} / ${formatBytes(homeMemory.total)}` : '-' }), _jsx("td", { children: homeHealth?.checkedAt ? new Date(String(homeHealth.checkedAt)).toLocaleString() : '-' }), _jsx("td", { children: _jsx("button", { type: "button", onClick: () => void handleSelectTarget(target.id), children: "Open Workbook" }) })] }, target.id));
+                                    }) : (_jsx("tr", { children: _jsx("td", { colSpan: 8, children: "No database targets are configured" }) })) })] }) })] })), showTopicPane && (_jsxs("section", { className: "topic-layout", children: [_jsxs("aside", { className: "topic-sidebar", children: [_jsx("h3", { children: "DBA Workbooks" }), _jsx("div", { className: "topic-list", children: topicItems.map((topic) => (_jsxs("button", { type: "button", className: `topic-button${selectedTopic === topic.id ? ' active' : ''}`, onClick: () => handleSelectTopic(topic.id), children: [_jsx("span", { className: "topic-code", children: topic.code }), topic.label] }, topic.id))) })] }), _jsxs("div", { className: "topic-content", children: [selectedTopic && !showHistoryView.topic && (_jsxs("div", { className: "snapshot-actions", style: { justifyContent: 'flex-end', marginBottom: 8 }, children: [_jsx("button", { type: "button", onClick: () => void refreshCurrentTopic(), disabled: !selectedTargetId || loading || historyLoading || securityLoading, children: loading || securityLoading ? 'Refreshing Telemetry...' : 'Refresh Workbook' }), renderExportMenu('live', false)] })), !selectedTopic && (_jsxs("section", { className: "ai-panel topic-placeholder", children: [_jsx("h2", { children: "Select a monitoring domain" }), _jsx("p", { children: "Click any topic on the left side to load that report on the right." })] })), showHistoryView.topic && (_jsxs("section", { className: "ai-panel", style: { marginTop: 0, position: 'relative' }, children: [_jsx("button", { className: "history-btn history-back-btn", onClick: closeHistoryView, children: "Back to Live Data" }), _jsxs("div", { className: "ai-title-row", children: [_jsxs("h2", { children: ["History View: ", showHistoryView.topic.charAt(0).toUpperCase() + showHistoryView.topic.slice(1)] }), _jsxs("div", { className: "snapshot-actions", children: [_jsx("input", { type: "datetime-local", value: historyFrom, onChange: (e) => setHistoryFrom(e.target.value) }), _jsx("input", { type: "datetime-local", value: historyTo, onChange: (e) => setHistoryTo(e.target.value) }), _jsx("button", { onClick: startHistorySearch, disabled: historyLoading, children: historyLoading ? 'Loading...' : 'Load History' }), renderExportMenu('topic-history', true)] })] }), _jsxs("div", { className: "snapshot-actions", style: { marginTop: 6, opacity: 0.9 }, children: [_jsxs("span", { children: ["Rows: ", topicHistory.length] }), _jsxs("span", { children: ["Offset: ", historyOffset] }), _jsxs("span", { children: ["Total: ", historyTotal] })] }), _jsxs("table", { className: "backup-table", style: { marginTop: 12 }, children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Snapshot ID" }), _jsx("th", { children: "Captured Timestamp" }), _jsxs("th", { children: [showHistoryView.topic.charAt(0).toUpperCase() + showHistoryView.topic.slice(1), " Metrics"] })] }) }), _jsx("tbody", { children: topicHistory.length > 0 ? (topicHistory.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.id }), _jsx("td", { children: new Date(row.capturedAt).toLocaleString() }), _jsx("td", { children: showHistoryView.topic === 'ple' && Array.isArray(row.value) && row.value.length > 0 ? (_jsxs("table", { style: { borderCollapse: 'collapse', width: '100%', fontSize: 13 }, children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { style: { borderBottom: '1px solid #ccc', textAlign: 'left', paddingRight: 8 }, children: "Node" }), _jsx("th", { style: { borderBottom: '1px solid #ccc', textAlign: 'left', paddingRight: 8 }, children: "PLE (sec)" })] }) }), _jsx("tbody", { children: row.value.map((ple, idx) => (_jsxs("tr", { children: [_jsx("td", { children: ple.node_name ?? '-' }), _jsx("td", { children: ple.page_life_expectancy ?? '-' })] }, ple.node_name || idx))) })] })) : showHistoryView.topic === 'ple' ? (_jsx("span", { style: { opacity: 0.75 }, children: "PLE was not captured for this snapshot." })) : Array.isArray(row.value) ? (_jsxs("div", { children: [_jsxs("div", { style: { marginBottom: 6, fontWeight: 600 }, children: ["Array with ", row.value.length, " item(s)"] }), _jsx("pre", { style: { maxWidth: 700, maxHeight: 180, overflow: 'auto', margin: 0 }, children: JSON.stringify(row.value, null, 2) })] })) : isLooseRecord(row.value) ? (_jsx("table", { style: { borderCollapse: 'collapse', width: '100%', fontSize: 13 }, children: _jsx("tbody", { children: Object.entries(row.value).map(([key, val]) => (_jsxs("tr", { children: [_jsx("th", { style: { textAlign: 'left', width: 220, borderBottom: '1px solid #ddd', paddingRight: 8 }, children: key }), _jsx("td", { style: { borderBottom: '1px solid #ddd' }, children: typeof val === 'object' ? JSON.stringify(val) : String(val ?? '-') })] }, key))) }) })) : (_jsx("pre", { style: { maxWidth: 700, maxHeight: 220, overflow: 'auto', margin: 0 }, children: JSON.stringify(row.value, null, 2) })) })] }, row.id)))) : (_jsx("tr", { children: _jsx("td", { colSpan: 3, children: "No history data found for selected range." }) })) })] }), _jsxs("div", { className: "history-pagination", children: [_jsx("button", { type: "button", disabled: !canGoPrev || historyLoading, onClick: () => showHistoryView.topic && void loadTopicHistory(showHistoryView.topic, Math.max(0, historyOffset - historyLimit)), children: "Previous" }), _jsxs("span", { children: ["Showing ", topicHistory.length === 0 ? 0 : historyOffset + 1, "-", historyOffset + topicHistory.length, " of ", historyTotal] }), _jsx("button", { type: "button", disabled: !canGoNext || historyLoading, onClick: () => showHistoryView.topic && void loadTopicHistory(showHistoryView.topic, historyOffset + historyLimit), children: "Next" })] })] })), selectedTopic === 'health' && !showHistoryView.topic && (_jsxs(MetricCard, { title: "Instance Health Overview", titleProps: { title: 'SQL Server uptime, version, and start time.' }, children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('health'), children: "History View" }), _jsx("table", { className: "backup-table compact-table", children: _jsx("tbody", { children: healthRows.map((row) => (_jsxs("tr", { children: [_jsx("th", { children: row.label }), _jsx("td", { children: row.value })] }, row.label))) }) }), _jsxs("div", { className: "metric-bars", "aria-label": "Health Signals", children: [_jsx("h4", { children: "Operational Health Indicators" }), _jsx(MiniBarChart, { data: [
                                                     { label: 'Uptime', value: toNumber(health.uptimeMinutes), suffix: ' min' },
                                                     { label: 'CPU', value: toNumber(health.cpuUsagePercent), suffix: ' %' },
                                                     { label: 'Memory', value: memoryUsedPercent, suffix: ' %' },
@@ -948,13 +1315,30 @@ export const App = () => {
                                                     label: `SPID ${String(row.session_id ?? '-')}`,
                                                     value: toNumber(row.wait_time),
                                                     suffix: ' ms'
-                                                })), height: 120, color: ["#d95d39", "#38618c"] })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Session ID" }), _jsx("th", { children: "Blocked By (Session ID)" }), _jsx("th", { children: "Session Status" }), _jsx("th", { children: "Wait Category" }), _jsx("th", { children: "Wait Time (ms)" })] }) }), _jsx("tbody", { children: blocking.length > 0 ? blocking.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: formatNumber(row.session_id) }), _jsx("td", { children: formatNumber(row.blocking_session_id) }), _jsx("td", { children: String(row.status ?? '-') }), _jsx("td", { children: String(row.wait_type ?? '-') }), _jsx("td", { children: formatNumber(row.wait_time) })] }, `${row.session_id}-${row.blocking_session_id}-${row.wait_time}`))) : (_jsx("tr", { children: _jsx("td", { colSpan: 5, children: "No active blocking chains detected" }) })) })] }) }), _jsx("div", { className: "metric-scroll", style: { marginTop: 8 }, children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "SQL Agent Job Name" }), _jsx("th", { children: "Run Date" }), _jsx("th", { children: "Run Time" }), _jsx("th", { children: "Error Message" })] }) }), _jsx("tbody", { children: failedJobs.length > 0 ? failedJobs.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: String(row.job_name ?? '-') }), _jsx("td", { children: String(row.run_date ?? '-') }), _jsx("td", { children: String(row.run_time ?? '-') }), _jsx("td", { title: String(row.error_message ?? ''), children: shortText(row.error_message, 110) })] }, `${row.job_name}-${row.run_date}-${row.run_time}`))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No failed SQL Agent jobs detected" }) })) })] }) })] })), selectedTopic === 'backups' && !showHistoryView.topic && (_jsxs(MetricCard, { title: "Backup Compliance Status", children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('backups'), children: "History View" }), _jsxs("div", { className: "backup-pane-layout", children: [_jsxs("section", { className: "backup-window", children: [_jsxs("div", { className: "backup-window-header", children: [_jsxs("div", { children: [_jsx("h4", { children: "Databases with Backup Policy Violations" }), _jsxs("p", { children: [failedBackups.length, " failed database backup", failedBackups.length === 1 ? '' : 's', " and ", successfulBackups.length, " successful database backup", successfulBackups.length === 1 ? '' : 's', "."] })] }), _jsx("button", { type: "button", onClick: () => setShowSuccessBackups(true), disabled: showSuccessBackups || successfulBackups.length === 0, children: "Show Compliant Backup Details" })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Last Full Backup" }), _jsx("th", { children: "Last Differential Backup" }), _jsx("th", { children: "Last Log Backup" })] }) }), _jsxs("tbody", { children: [data.backups.length > 0 ? failedBackups.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { className: getBackupStatusClass(row.last_full_backup, 'full'), title: getBackupStalenessTooltip(row.last_full_backup), children: row.last_full_backup ? new Date(row.last_full_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_diff_backup, 'diff'), title: getBackupStalenessTooltip(row.last_diff_backup), children: row.last_diff_backup ? new Date(row.last_diff_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_log_backup, 'log'), title: getBackupStalenessTooltip(row.last_log_backup), children: row.last_log_backup ? new Date(row.last_log_backup).toLocaleString() : '-' })] }, row.database_name))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No backup metadata returned" }) })), data.backups.length > 0 && failedBackups.length === 0 && (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No backup policy violations detected" }) }))] })] }) })] }), showSuccessBackups && (_jsxs("section", { className: "backup-window backup-window-secondary", children: [_jsxs("div", { className: "backup-window-header", children: [_jsxs("div", { children: [_jsx("h4", { children: "Databases Meeting Backup Policy" }), _jsxs("p", { children: [successfulBackups.length, " databases with a recorded successful full backup."] })] }), _jsx("button", { type: "button", onClick: () => setShowSuccessBackups(false), children: "Close Window" })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Last Full Backup" }), _jsx("th", { children: "Last Differential Backup" }), _jsx("th", { children: "Last Log Backup" })] }) }), _jsx("tbody", { children: successfulBackups.length > 0 ? successfulBackups.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { className: getBackupStatusClass(row.last_full_backup, 'full'), title: getBackupStalenessTooltip(row.last_full_backup), children: row.last_full_backup ? new Date(row.last_full_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_diff_backup, 'diff'), title: getBackupStalenessTooltip(row.last_diff_backup), children: row.last_diff_backup ? new Date(row.last_diff_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_log_backup, 'log'), title: getBackupStalenessTooltip(row.last_log_backup), children: row.last_log_backup ? new Date(row.last_log_backup).toLocaleString() : '-' })] }, row.database_name))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No compliant backup entries found" }) })) })] }) })] }))] })] })), selectedTopic === 'ple' && !showHistoryView.topic && (_jsxs(MetricCard, { title: "Buffer Cache Page Life Expectancy", titleProps: { title: 'PLE values by NUMA node and recent trend.' }, children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('ple'), children: "History View" }), _jsxs("div", { className: "metric-bars", "aria-label": "PLE Trend", children: [_jsx("h4", { children: "Recent PLE Trend (24h)" }), _jsx(MiniBarChart, { data: pleHourlyBars, height: 180, color: ["#38618c", "#f2c14e"] })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "NUMA Node ID" }), _jsx("th", { children: "NUMA Node Name" }), _jsx("th", { children: "Page Life Expectancy (sec)" })] }) }), _jsx("tbody", { children: pleData.length > 0 ? pleData.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.node_id }), _jsx("td", { children: String(row.node_name ?? '-') }), _jsx("td", { children: row.page_life_expectancy })] }, row.node_id))) : (_jsx("tr", { children: _jsx("td", { colSpan: 3, children: "No PLE metrics returned" }) })) })] }) })] })), selectedTopic === 'suggestions' && !showHistoryView.topic && (_jsxs(_Fragment, { children: [_jsxs(MetricCard, { title: "Missing Index Recommendations", titleProps: { title: 'Indexes that should be created for better performance.' }, children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('suggestions'), children: "History View" }), _jsx("div", { className: "metric-bars", style: { marginBottom: 16 }, children: _jsx(MiniBarChart, { data: suggestionsData.missingIndexes.map((row, idx) => ({
+                                                })), height: 120, color: ["#d95d39", "#38618c"] })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Session ID" }), _jsx("th", { children: "Blocked By (Session ID)" }), _jsx("th", { children: "Session Status" }), _jsx("th", { children: "Wait Category" }), _jsx("th", { children: "Wait Time (ms)" })] }) }), _jsx("tbody", { children: blocking.length > 0 ? blocking.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: formatNumber(row.session_id) }), _jsx("td", { children: formatNumber(row.blocking_session_id) }), _jsx("td", { children: String(row.status ?? '-') }), _jsx("td", { children: String(row.wait_type ?? '-') }), _jsx("td", { children: formatNumber(row.wait_time) })] }, `${row.session_id}-${row.blocking_session_id}-${row.wait_time}`))) : (_jsx("tr", { children: _jsx("td", { colSpan: 5, children: "No active blocking chains detected" }) })) })] }) }), _jsx("div", { className: "metric-scroll", style: { marginTop: 8 }, children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "SQL Agent Job Name" }), _jsx("th", { children: "Run Date" }), _jsx("th", { children: "Run Time" }), _jsx("th", { children: "Error Message" })] }) }), _jsx("tbody", { children: failedJobs.length > 0 ? failedJobs.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: String(row.job_name ?? '-') }), _jsx("td", { children: String(row.run_date ?? '-') }), _jsx("td", { children: String(row.run_time ?? '-') }), _jsx("td", { title: String(row.error_message ?? ''), children: shortText(row.error_message, 110) })] }, `${row.job_name}-${row.run_date}-${row.run_time}`))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No failed SQL Agent jobs detected" }) })) })] }) })] })), selectedTopic === 'backups' && !showHistoryView.topic && (_jsxs(MetricCard, { title: "Backup Compliance Status", children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('backups'), children: "History View" }), _jsxs("div", { className: "backup-pane-layout", children: [_jsxs("section", { className: "backup-window", children: [_jsxs("div", { className: "backup-window-header", children: [_jsxs("div", { children: [_jsx("h4", { children: "Databases with Backup Policy Violations" }), _jsxs("p", { children: [failedBackups.length, " failed database backup", failedBackups.length === 1 ? '' : 's', " and ", successfulBackups.length, " successful database backup", successfulBackups.length === 1 ? '' : 's', "."] })] }), _jsx("button", { type: "button", onClick: () => setShowSuccessBackups(true), disabled: showSuccessBackups || successfulBackups.length === 0, children: "Show Compliant Backup Details" })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Last Full Backup" }), _jsx("th", { children: "Last Differential Backup" }), _jsx("th", { children: "Last Log Backup" })] }) }), _jsxs("tbody", { children: [data.backups.length > 0 ? failedBackups.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { className: getBackupStatusClass(row.last_full_backup, 'full'), title: getBackupStalenessTooltip(row.last_full_backup), children: row.last_full_backup ? new Date(row.last_full_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_diff_backup, 'diff'), title: getBackupStalenessTooltip(row.last_diff_backup), children: row.last_diff_backup ? new Date(row.last_diff_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_log_backup, 'log'), title: getBackupStalenessTooltip(row.last_log_backup), children: row.last_log_backup ? new Date(row.last_log_backup).toLocaleString() : '-' })] }, row.database_name))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No backup metadata returned" }) })), data.backups.length > 0 && failedBackups.length === 0 && (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No backup policy violations detected" }) }))] })] }) })] }), showSuccessBackups && (_jsxs("section", { className: "backup-window backup-window-secondary", children: [_jsxs("div", { className: "backup-window-header", children: [_jsxs("div", { children: [_jsx("h4", { children: "Databases Meeting Backup Policy" }), _jsxs("p", { children: [successfulBackups.length, " databases with a recorded successful full backup."] })] }), _jsx("button", { type: "button", onClick: () => setShowSuccessBackups(false), children: "Close Window" })] }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Last Full Backup" }), _jsx("th", { children: "Last Differential Backup" }), _jsx("th", { children: "Last Log Backup" })] }) }), _jsx("tbody", { children: successfulBackups.length > 0 ? successfulBackups.map((row) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { className: getBackupStatusClass(row.last_full_backup, 'full'), title: getBackupStalenessTooltip(row.last_full_backup), children: row.last_full_backup ? new Date(row.last_full_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_diff_backup, 'diff'), title: getBackupStalenessTooltip(row.last_diff_backup), children: row.last_diff_backup ? new Date(row.last_diff_backup).toLocaleString() : '-' }), _jsx("td", { className: getBackupStatusClass(row.last_log_backup, 'log'), title: getBackupStalenessTooltip(row.last_log_backup), children: row.last_log_backup ? new Date(row.last_log_backup).toLocaleString() : '-' })] }, row.database_name))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No compliant backup entries found" }) })) })] }) })] }))] })] })), selectedTopic === 'ple' && !showHistoryView.topic && (_jsxs(MetricCard, { title: "Buffer Cache Page Life Expectancy", titleProps: { title: 'PLE values by NUMA node and recent trend.' }, children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('ple'), children: "History View" }), _jsxs("div", { className: "metric-bars", "aria-label": "PLE Trend", children: [_jsx("h4", { children: "Recent PLE Trend (24h)" }), _jsx(MiniBarChart, { data: pleHourlyBars, height: 180, color: ["#38618c", "#f2c14e"] })] }), pleData.length > 1 && (_jsxs("div", { style: { background: '#fffbe6', color: '#ad6800', padding: '10px', borderRadius: 6, margin: '12px 0', fontSize: 15 }, children: [_jsx("b", { children: "Multiple NUMA nodes detected:" }), " PLE should be monitored ", _jsx("b", { children: "per NUMA node" }), ".", _jsx("br", {}), "Low PLE values (< 300 sec) on any node may indicate memory pressure. The ", _jsx("b", { children: "_Total" }), " value is not always representative in multi-NUMA systems."] })), pleData.length === 1 && pleData[0].node_name === '_Total' && (_jsxs("div", { style: { background: '#e6f7ff', color: '#0050b3', padding: '10px', borderRadius: 6, margin: '12px 0', fontSize: 15 }, children: [_jsx("b", { children: "Single NUMA node or legacy hardware:" }), " Only the ", _jsx("b", { children: "_Total" }), " PLE is available.", _jsx("br", {}), "Low PLE values (< 300 sec) may indicate memory pressure."] })), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "NUMA Node Name" }), _jsx("th", { children: "Page Life Expectancy (sec)" }), _jsx("th", { children: "Status" })] }) }), _jsx("tbody", { children: pleData.length > 0 ? pleData.map((row, idx) => {
+                                                        const ple = Number(row.page_life_expectancy);
+                                                        let status = 'OK';
+                                                        let statusClass = '';
+                                                        if (ple < 300) {
+                                                            status = 'LOW';
+                                                            statusClass = 'backup-stale';
+                                                        }
+                                                        else if (ple < 1000) {
+                                                            status = 'Warning';
+                                                            statusClass = 'backup-warning';
+                                                        }
+                                                        else {
+                                                            status = 'Healthy';
+                                                            statusClass = 'backup-ok';
+                                                        }
+                                                        return (_jsxs("tr", { children: [_jsx("td", { children: String(row.node_name ?? '-') }), _jsx("td", { children: ple }), _jsx("td", { className: statusClass, children: status })] }, row.node_name || idx));
+                                                    }) : (_jsx("tr", { children: _jsx("td", { colSpan: 3, children: "No PLE metrics returned" }) })) })] }) })] })), selectedTopic === 'suggestions' && !showHistoryView.topic && (_jsxs(_Fragment, { children: [_jsxs(MetricCard, { title: "Missing Index Recommendations", titleProps: { title: 'Indexes that should be created for better performance.' }, children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('suggestions'), children: "History View" }), _jsx("div", { className: "metric-bars", style: { marginBottom: 16 }, children: _jsx(MiniBarChart, { data: suggestionsData.missingIndexes.map((row, idx) => ({
                                                         label: row.table_name || `Table ${idx + 1}`,
                                                         value: Number(row.impact) || 0
                                                     })), height: 180, color: ["#d95d39", "#38618c"] }) }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Table Name" }), _jsx("th", { children: "Equality Columns" }), _jsx("th", { children: "Inequality Columns" }), _jsx("th", { children: "Included Columns" }), _jsx("th", { children: "Estimated Impact" }), _jsx("th", { children: "CREATE INDEX Statement" })] }) }), _jsx("tbody", { children: suggestionsData.missingIndexes.length > 0 ? suggestionsData.missingIndexes.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.table_name }), _jsx("td", { children: row.equality_columns }), _jsx("td", { children: row.inequality_columns }), _jsx("td", { children: row.included_columns }), _jsx("td", { children: row.impact }), _jsxs("td", { children: [_jsx("code", { style: { fontSize: '0.85em' }, children: row.create_statement }), _jsx("button", { style: { marginLeft: 8 }, onClick: () => void handleCopyText(`create-${idx}`, String(row.create_statement ?? '')), children: copiedKey === `create-${idx}` ? 'Copied' : 'Copy' })] })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "No missing index recommendations returned" }) })) })] }) })] }), _jsxs(MetricCard, { title: "Fragmented Indexes (>20%)", titleProps: { title: 'Indexes with high fragmentation that should be rebuilt.' }, children: [_jsx("div", { className: "metric-bars", style: { marginBottom: 16 }, children: _jsx(MiniBarChart, { data: suggestionsData.fragmentedIndexes.map((row, idx) => ({
                                                         label: row.index_name || `Index ${idx + 1}`,
                                                         value: Number(row.avg_fragmentation_in_percent) || 0
-                                                    })), height: 180, color: ["#f2c14e", "#d95d39"] }) }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Table Name" }), _jsx("th", { children: "Index Name" }), _jsx("th", { children: "Fragmentation (%)" }), _jsx("th", { children: "ALTER INDEX Statement" })] }) }), _jsx("tbody", { children: suggestionsData.fragmentedIndexes.length > 0 ? suggestionsData.fragmentedIndexes.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.table_name }), _jsx("td", { children: row.index_name }), _jsx("td", { children: row.avg_fragmentation_in_percent }), _jsxs("td", { children: [_jsx("code", { style: { fontSize: '0.85em' }, children: row.alter_statement }), _jsx("button", { style: { marginLeft: 8 }, onClick: () => void handleCopyText(`alter-${idx}`, String(row.alter_statement ?? '')), children: copiedKey === `alter-${idx}` ? 'Copied' : 'Copy' })] })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 5, children: "No indexes above 20% fragmentation threshold" }) })) })] }) })] })] })), selectedTopic === 'history' && !showHistoryView.topic && (_jsxs("section", { className: "ai-panel", style: { marginTop: 0 }, children: [_jsxs("div", { className: "ai-title-row", children: [_jsx("h2", { children: "Monitoring Snapshot Audit Trail" }), _jsxs("div", { className: "snapshot-actions", children: [_jsx("button", { onClick: startHistorySearch, disabled: historyLoading, children: historyLoading ? 'Loading...' : 'Load History' }), _jsx("button", { onClick: () => void exportSnapshotsCsv(), disabled: historyLoading, children: "Export CSV (All Filtered)" }), _jsx("button", { onClick: () => void exportSnapshotsJson(), disabled: historyLoading, children: "Export JSON (All Filtered)" })] })] }), _jsxs("div", { className: "hero-row", style: { marginTop: 8 }, children: [_jsx("input", { type: "datetime-local", value: historyFrom, onChange: (e) => setHistoryFrom(e.target.value) }), _jsx("input", { type: "datetime-local", value: historyTo, onChange: (e) => setHistoryTo(e.target.value) }), _jsx("input", { type: "number", min: 5, max: 500, value: historyLimit, onChange: (e) => setHistoryLimit(Math.min(500, Math.max(5, Number.parseInt(e.target.value, 10) || 25))), title: "Rows per page" }), _jsxs("label", { className: "target-checkbox", style: { marginLeft: 8 }, children: [_jsx("input", { type: "checkbox", checked: historyAuditOnly, onChange: (e) => {
+                                                    })), height: 180, color: ["#f2c14e", "#d95d39"] }) }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Table Name" }), _jsx("th", { children: "Index Name" }), _jsx("th", { children: "Fragmentation (%)" }), _jsx("th", { children: "ALTER INDEX Statement" })] }) }), _jsx("tbody", { children: suggestionsData.fragmentedIndexes.length > 0 ? suggestionsData.fragmentedIndexes.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.table_name }), _jsx("td", { children: row.index_name }), _jsx("td", { children: row.avg_fragmentation_in_percent }), _jsxs("td", { children: [_jsx("code", { style: { fontSize: '0.85em' }, children: row.alter_statement }), _jsx("button", { style: { marginLeft: 8 }, onClick: () => void handleCopyText(`alter-${idx}`, String(row.alter_statement ?? '')), children: copiedKey === `alter-${idx}` ? 'Copied' : 'Copy' })] })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 5, children: "No indexes above 20% fragmentation threshold" }) })) })] }) })] })] })), selectedTopic === 'history' && !showHistoryView.topic && (_jsxs("section", { className: "ai-panel", style: { marginTop: 0 }, children: [_jsxs("div", { className: "ai-title-row", children: [_jsx("h2", { children: "Monitoring Snapshot Audit Trail (DBA Repository)" }), _jsxs("div", { className: "snapshot-actions", children: [_jsx("button", { onClick: startHistorySearch, disabled: historyLoading, children: historyLoading ? 'Loading...' : 'Load History' }), renderExportMenu('audit-history', true)] })] }), _jsxs("div", { className: "hero-row", style: { marginTop: 8 }, children: [_jsx("input", { type: "datetime-local", value: historyFrom, onChange: (e) => setHistoryFrom(e.target.value) }), _jsx("input", { type: "datetime-local", value: historyTo, onChange: (e) => setHistoryTo(e.target.value) }), _jsx("input", { type: "number", min: 5, max: 500, value: historyLimit, onChange: (e) => setHistoryLimit(Math.min(500, Math.max(5, Number.parseInt(e.target.value, 10) || 25))), title: "Rows per page" }), _jsxs("label", { className: "target-checkbox", style: { marginLeft: 8 }, children: [_jsx("input", { type: "checkbox", checked: historyAuditOnly, onChange: (e) => {
                                                             setHistoryAuditOnly(e.target.checked);
                                                             if (!e.target.checked) {
                                                                 setHistoryAuditOutcome('all');
@@ -971,9 +1355,9 @@ export const App = () => {
                                                 }, disabled: historyLoading, style: { fontWeight: historyAuditOnly && historyAuditOutcome === 'succeeded' ? 700 : 400 }, children: "Successful Outcomes" }), _jsx("button", { type: "button", onClick: () => {
                                                     setHistoryAuditOnly(true);
                                                     setHistoryAuditOutcome('failed');
-                                                }, disabled: historyLoading, style: { fontWeight: historyAuditOnly && historyAuditOutcome === 'failed' ? 700 : 400 }, children: "Failed Outcomes" })] }), _jsxs("table", { className: "backup-table", style: { marginTop: 12 }, children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Snapshot ID" }), _jsx("th", { children: "Captured Timestamp" }), _jsx("th", { children: "Target" }), _jsx("th", { children: "Event" }), _jsx("th", { children: "Health Summary" }), _jsx("th", { children: "Alert Summary" }), _jsx("th", { children: "Details" })] }) }), _jsx("tbody", { children: historyRows.length > 0 ? (historyRows.map((row) => (_jsxs(Fragment, { children: [_jsxs("tr", { children: [_jsx("td", { children: row.id }), _jsx("td", { children: new Date(row.capturedAt).toLocaleString() }), _jsx("td", { children: row.targetId }), _jsx("td", { children: _jsx("span", { className: getHistoryEventClassName(row), children: formatHistoryEvent(row) }) }), _jsxs("td", { title: JSON.stringify(row.health), children: [JSON.stringify(row.health).slice(0, 80), JSON.stringify(row.health).length > 80 ? 'ΓÇª' : ''] }), _jsxs("td", { title: JSON.stringify(row.alerts), children: [JSON.stringify(row.alerts).slice(0, 80), JSON.stringify(row.alerts).length > 80 ? 'ΓÇª' : ''] }), _jsx("td", { children: _jsx("button", { type: "button", onClick: () => setExpandedSnapshotId((current) => current === row.id ? null : row.id), children: expandedSnapshotId === row.id ? 'Hide' : 'View' }) })] }), expandedSnapshotId === row.id && (_jsx("tr", { children: _jsxs("td", { colSpan: 7, children: [_jsx("div", { className: "snapshot-actions", style: { marginBottom: 8 }, children: _jsx("button", { type: "button", onClick: () => void copySnapshotJson(row), children: "Copy JSON" }) }), _jsx("pre", { className: "snapshot-json", children: JSON.stringify(row, null, 2) })] }) }))] }, row.id)))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: historyAuditOnly ? 'No session-kill audit events found for the selected outcome' : 'No snapshots found' }) })) })] }), _jsxs("div", { className: "history-pagination", children: [_jsx("button", { type: "button", disabled: !canGoPrev || historyLoading, onClick: () => void loadSnapshotHistory(Math.max(0, historyOffset - historyLimit)), children: "Previous" }), _jsxs("span", { children: ["Showing ", historyRows.length === 0 ? 0 : historyOffset + 1, "-", historyOffset + historyRows.length, " of ", historyTotal, historyAuditOnly ? ` (filtered: ${historyRows.length}${historyAuditOutcome !== 'all' ? `, outcome: ${historyAuditOutcome}` : ''})` : ''] }), _jsx("button", { type: "button", disabled: !canGoNext || historyLoading, onClick: () => void loadSnapshotHistory(historyOffset + historyLimit), children: "Next" })] })] })), selectedTopic === 'security' && !showHistoryView.topic && (_jsxs("section", { className: "ai-panel", children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('security'), children: "History View" }), _jsxs("div", { className: "panel-title-row", children: [_jsx("h2", { children: "Security & Access Control" }), _jsx("button", { onClick: () => {
+                                                }, disabled: historyLoading, style: { fontWeight: historyAuditOnly && historyAuditOutcome === 'failed' ? 700 : 400 }, children: "Failed Outcomes" })] }), _jsxs("table", { className: "backup-table", style: { marginTop: 12 }, children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Snapshot ID" }), _jsx("th", { children: "Captured At" }), _jsx("th", { children: "Target Instance" }), _jsx("th", { children: "Event" }), _jsx("th", { children: "Health Summary" }), _jsx("th", { children: "Alert Summary" }), _jsx("th", { children: "Details" })] }) }), _jsx("tbody", { children: historyRows.length > 0 ? (historyRows.map((row) => (_jsxs(Fragment, { children: [_jsxs("tr", { children: [_jsx("td", { children: row.id }), _jsx("td", { children: new Date(row.capturedAt).toLocaleString() }), _jsx("td", { children: row.targetId }), _jsx("td", { children: _jsx("span", { className: getHistoryEventClassName(row), children: formatHistoryEvent(row) }) }), _jsxs("td", { title: JSON.stringify(row.health), children: [JSON.stringify(row.health).slice(0, 80), JSON.stringify(row.health).length > 80 ? 'ΓÇª' : ''] }), _jsxs("td", { title: JSON.stringify(row.alerts), children: [JSON.stringify(row.alerts).slice(0, 80), JSON.stringify(row.alerts).length > 80 ? 'ΓÇª' : ''] }), _jsx("td", { children: _jsx("button", { type: "button", onClick: () => setExpandedSnapshotId((current) => current === row.id ? null : row.id), children: expandedSnapshotId === row.id ? 'Hide Detail' : 'View Detail' }) })] }), expandedSnapshotId === row.id && (_jsx("tr", { children: _jsxs("td", { colSpan: 7, children: [_jsx("div", { className: "snapshot-actions", style: { marginBottom: 8 }, children: _jsx("button", { type: "button", onClick: () => void copySnapshotJson(row), children: "Copy JSON" }) }), _jsx("pre", { className: "snapshot-json", children: JSON.stringify(row, null, 2) })] }) }))] }, row.id)))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: historyAuditOnly ? 'No session-kill audit events found for the selected outcome' : 'No snapshots found' }) })) })] }), _jsxs("div", { className: "history-pagination", children: [_jsx("button", { type: "button", disabled: !canGoPrev || historyLoading, onClick: () => void loadSnapshotHistory(Math.max(0, historyOffset - historyLimit)), children: "Previous Page" }), _jsxs("span", { children: ["Showing ", historyRows.length === 0 ? 0 : historyOffset + 1, "-", historyOffset + historyRows.length, " of ", historyTotal, historyAuditOnly ? ` (filtered: ${historyRows.length}${historyAuditOutcome !== 'all' ? `, outcome: ${historyAuditOutcome}` : ''})` : ''] }), _jsx("button", { type: "button", disabled: !canGoNext || historyLoading, onClick: () => void loadSnapshotHistory(historyOffset + historyLimit), children: "Next Page" })] })] })), selectedTopic === 'security' && !showHistoryView.topic && (_jsxs("section", { className: "ai-panel", children: [_jsx("button", { className: "history-btn", style: { position: 'absolute', top: 16, right: 24, zIndex: 2 }, onClick: () => openHistoryView('security'), children: "History View" }), _jsxs("div", { className: "panel-title-row", children: [_jsx("h2", { children: "Security, Principals & Privilege Posture" }), _jsx("button", { onClick: () => {
                                                     if (selectedTargetId) {
                                                         void loadSecurityForTarget(selectedTargetId);
                                                     }
-                                                }, disabled: securityLoading, children: securityLoading ? 'LoadingΓÇª' : 'Refresh Security Data' })] }), securityLoading && _jsx("p", { children: "Loading security data\u0393\u00C7\u00AA" }), !securityLoading && !securityData && _jsx("p", { children: "Security data unavailable. Click Refresh to load." }), securityData && (_jsxs(_Fragment, { children: [_jsx("h3", { style: { marginTop: 16 }, children: "SQL Server Logins" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Login Name" }), _jsx("th", { children: "Login Type" }), _jsx("th", { children: "Status" }), _jsx("th", { children: "Password Policy" }), _jsx("th", { children: "Password Expiration" }), _jsx("th", { children: "Default Database" }), _jsx("th", { children: "Server Roles" }), _jsx("th", { children: "Created" }), _jsx("th", { children: "Last Modified" })] }) }), _jsx("tbody", { children: securityData.serverLogins.length > 0 ? securityData.serverLogins.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.login_name }), _jsx("td", { children: row.login_type.replace(/_/g, ' ') }), _jsx("td", { children: _jsx("span", { className: row.is_disabled ? 'status-warn' : 'status-ok', children: row.is_disabled ? 'Disabled' : 'Enabled' }) }), _jsx("td", { children: row.is_policy_checked ? 'Enforced' : 'Not Enforced' }), _jsx("td", { children: row.is_expiration_checked ? 'Enforced' : 'Not Enforced' }), _jsx("td", { children: row.default_database }), _jsx("td", { children: row.server_roles || '(none)' }), _jsx("td", { children: row.create_date }), _jsx("td", { children: row.modify_date })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 9, children: "No SQL Server logins found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Server-Level Role Memberships" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Server Role" }), _jsx("th", { children: "Member Login" }), _jsx("th", { children: "Member Type" }), _jsx("th", { children: "Member Status" })] }) }), _jsx("tbody", { children: securityData.serverRoles.length > 0 ? securityData.serverRoles.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.role_name }), _jsx("td", { children: row.member_name }), _jsx("td", { children: row.member_type.replace(/_/g, ' ') }), _jsx("td", { children: _jsx("span", { className: row.is_member_disabled ? 'status-warn' : 'status-ok', children: row.is_member_disabled ? 'Disabled' : 'Active' }) })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No server role memberships found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Database Users" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "User Name" }), _jsx("th", { children: "User Type" }), _jsx("th", { children: "Mapped Login" }), _jsx("th", { children: "Default Schema" }), _jsx("th", { children: "Database Roles" }), _jsx("th", { children: "Created" })] }) }), _jsx("tbody", { children: securityData.dbUsers.length > 0 ? securityData.dbUsers.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.user_name }), _jsx("td", { children: row.user_type.replace(/_/g, ' ') }), _jsx("td", { children: row.login_name || '(none)' }), _jsx("td", { children: row.default_schema }), _jsx("td", { children: row.db_roles || '(none)' }), _jsx("td", { children: row.create_date })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "No database users found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Database-Level Role Memberships" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Database Role" }), _jsx("th", { children: "Member Name" }), _jsx("th", { children: "Member Type" })] }) }), _jsx("tbody", { children: securityData.dbRoles.length > 0 ? securityData.dbRoles.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.role_name }), _jsx("td", { children: row.member_name }), _jsx("td", { children: row.member_type.replace(/_/g, ' ') })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No database role memberships found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Explicit Object Permissions" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Principal Name" }), _jsx("th", { children: "Principal Type" }), _jsx("th", { children: "Object Name" }), _jsx("th", { children: "Object Type" }), _jsx("th", { children: "Permission" }), _jsx("th", { children: "Grant State" })] }) }), _jsx("tbody", { children: securityData.objectPermissions.length > 0 ? securityData.objectPermissions.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.principal_name }), _jsx("td", { children: row.principal_type.replace(/_/g, ' ') }), _jsx("td", { children: row.object_name || '(database)' }), _jsx("td", { children: row.object_type.replace(/_/g, ' ') }), _jsx("td", { children: row.permission_name }), _jsx("td", { children: _jsx("span", { className: row.permission_state === 'DENY' ? 'status-critical' : 'status-ok', children: row.permission_state }) })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "No explicit object permissions found" }) })) })] }) })] }))] }))] })] }))] }));
+                                                }, disabled: securityLoading, children: securityLoading ? 'Loading...' : 'Refresh Security Telemetry' })] }), securityLoading && _jsx("p", { children: "Loading security telemetry..." }), !securityLoading && !securityData && _jsx("p", { children: "Security data unavailable. Click Refresh to load." }), securityData && (_jsxs(_Fragment, { children: [_jsx("h3", { style: { marginTop: 16 }, children: "SQL Server Logins" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Login Name" }), _jsx("th", { children: "Login Type" }), _jsx("th", { children: "Status" }), _jsx("th", { children: "Password Policy" }), _jsx("th", { children: "Password Expiration" }), _jsx("th", { children: "Default Database" }), _jsx("th", { children: "Server Roles" }), _jsx("th", { children: "Created" }), _jsx("th", { children: "Last Modified" })] }) }), _jsx("tbody", { children: securityData.serverLogins.length > 0 ? securityData.serverLogins.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.login_name }), _jsx("td", { children: row.login_type.replace(/_/g, ' ') }), _jsx("td", { children: _jsx("span", { className: row.is_disabled ? 'status-warn' : 'status-ok', children: row.is_disabled ? 'Disabled' : 'Enabled' }) }), _jsx("td", { children: row.is_policy_checked ? 'Enforced' : 'Not Enforced' }), _jsx("td", { children: row.is_expiration_checked ? 'Enforced' : 'Not Enforced' }), _jsx("td", { children: row.default_database }), _jsx("td", { children: row.server_roles || '(none)' }), _jsx("td", { children: row.create_date }), _jsx("td", { children: row.modify_date })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 9, children: "No SQL Server logins found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Server-Level Role Memberships" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Server Role" }), _jsx("th", { children: "Member Login" }), _jsx("th", { children: "Member Type" }), _jsx("th", { children: "Member Status" })] }) }), _jsx("tbody", { children: securityData.serverRoles.length > 0 ? securityData.serverRoles.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.role_name }), _jsx("td", { children: row.member_name }), _jsx("td", { children: row.member_type.replace(/_/g, ' ') }), _jsx("td", { children: _jsx("span", { className: row.is_member_disabled ? 'status-warn' : 'status-ok', children: row.is_member_disabled ? 'Disabled' : 'Active' }) })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No server role memberships found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Database Principals" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Principal Name" }), _jsx("th", { children: "Principal Type" }), _jsx("th", { children: "Mapped Login" }), _jsx("th", { children: "Default Schema" }), _jsx("th", { children: "Database Roles" }), _jsx("th", { children: "Created" })] }) }), _jsx("tbody", { children: securityData.dbUsers.length > 0 ? securityData.dbUsers.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.user_name }), _jsx("td", { children: row.user_type.replace(/_/g, ' ') }), _jsx("td", { children: row.login_name || '(none)' }), _jsx("td", { children: row.default_schema }), _jsx("td", { children: row.db_roles || '(none)' }), _jsx("td", { children: row.create_date })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "No database users found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Database Role Memberships" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Database Role" }), _jsx("th", { children: "Member Name" }), _jsx("th", { children: "Member Type" })] }) }), _jsx("tbody", { children: securityData.dbRoles.length > 0 ? securityData.dbRoles.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.role_name }), _jsx("td", { children: row.member_name }), _jsx("td", { children: row.member_type.replace(/_/g, ' ') })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 4, children: "No database role memberships found" }) })) })] }) }), _jsx("h3", { style: { marginTop: 20 }, children: "Explicit Object-Level Permissions" }), _jsx("div", { className: "metric-scroll", children: _jsxs("table", { className: "backup-table compact-table", children: [_jsx("thead", { children: _jsxs("tr", { children: [_jsx("th", { children: "Database Name" }), _jsx("th", { children: "Principal Name" }), _jsx("th", { children: "Principal Type" }), _jsx("th", { children: "Object Name" }), _jsx("th", { children: "Object Type" }), _jsx("th", { children: "Permission" }), _jsx("th", { children: "Grant State" })] }) }), _jsx("tbody", { children: securityData.objectPermissions.length > 0 ? securityData.objectPermissions.map((row, idx) => (_jsxs("tr", { children: [_jsx("td", { children: row.database_name }), _jsx("td", { children: row.principal_name }), _jsx("td", { children: row.principal_type.replace(/_/g, ' ') }), _jsx("td", { children: row.object_name || '(database)' }), _jsx("td", { children: row.object_type.replace(/_/g, ' ') }), _jsx("td", { children: row.permission_name }), _jsx("td", { children: _jsx("span", { className: row.permission_state === 'DENY' ? 'status-critical' : 'status-ok', children: row.permission_state }) })] }, idx))) : (_jsx("tr", { children: _jsx("td", { colSpan: 7, children: "No explicit object permissions found" }) })) })] }) })] }))] }))] })] }))] }));
 };

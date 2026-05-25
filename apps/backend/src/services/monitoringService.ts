@@ -529,24 +529,25 @@ export const monitoringService = {
 
 // --- New: PLE and Index Suggestions ---
 export const pleAndSuggestionsService = {
+  /**
+   * Returns Page Life Expectancy (PLE) per NUMA node and for the total buffer pool (_Total).
+   * Best-practice: Always monitor PLE per NUMA node, not just _Total. Low PLE (<300s) may indicate memory pressure.
+   */
   async ple(targetId?: string) {
-    // PLE is exposed as cntr_value in dm_os_performance_counters.
     return runQuery<{
-      node_id: number;
       node_name: string;
       page_life_expectancy: number;
     }>(
       `
       SELECT
-        ROW_NUMBER() OVER (
-          ORDER BY CASE WHEN instance_name = '_Total' THEN 1 ELSE 0 END, instance_name
-        ) AS node_id,
-        COALESCE(NULLIF(instance_name, ''), '_Total') AS node_name,
-        CAST(cntr_value AS BIGINT) AS page_life_expectancy
-      FROM sys.dm_os_performance_counters
-      WHERE counter_name = 'Page life expectancy'
-        AND object_name LIKE '%Buffer Manager%'
-      ORDER BY node_id;
+        COALESCE(NULLIF(pc.instance_name, ''), '_Total') AS node_name,
+        CAST(pc.cntr_value AS BIGINT) AS page_life_expectancy
+      FROM sys.dm_os_performance_counters AS pc
+      WHERE pc.object_name LIKE '%Buffer Manager%'
+        AND pc.counter_name = 'Page life expectancy'
+      ORDER BY
+        CASE WHEN pc.instance_name = '_Total' THEN 1 ELSE 0 END,
+        pc.instance_name;
       `,
       targetId
     );

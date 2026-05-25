@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: c:\Users\sc1004408\db-monitoring-ai
+      dockerfile: apps/backend/Dockerfile
+    environment:
+      APP_PORT: 4000
+    ports:
+      - "4000:4000"
+    restart: unless-stopped

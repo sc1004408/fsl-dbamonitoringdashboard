@@ -1,0 +1,25 @@
+# Updated to use absolute paths for volumes to avoid build context issues
+version: '3.8'
+services:
+  backend:
+    build:
+      context: c:\Users\sc1004408\db-monitoring-ai
+      dockerfile: apps/backend/Dockerfile
+    ports:
+      - "4000:4000"
+    volumes:
+      - c:\Users\sc1004408\db-monitoring-ai\apps\backend:/app
+    environment:
+      - NODE_ENV=development
+    command: npm run dev
+  frontend:
+    build:
+      context: c:\Users\sc1004408\db-monitoring-ai
+      dockerfile: apps/frontend/Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - c:\Users\sc1004408\db-monitoring-ai\apps\frontend:/app
+    environment:
+      - NODE_ENV=development
+    command: npm run dev

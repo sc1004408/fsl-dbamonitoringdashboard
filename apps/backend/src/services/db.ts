@@ -225,6 +225,66 @@ const ensureStoreDirectory = async (): Promise<void> => {
   await fs.mkdir(path.dirname(targetStorePath), { recursive: true });
 };
 
+const recoverTargetsFromMonitoringServerList = async (): Promise<void> => {
+  let pool: sql.ConnectionPool | null = null;
+  try {
+    pool = await buildPool(defaultConnectionString).connect();
+    const result = await pool.request().query<{
+      targetId: string;
+      targetName: string;
+      serverName: string;
+      port: number;
+      databaseName: string;
+      userId: string;
+      encrypt: boolean;
+      trustServerCertificate: boolean;
+    }>(`
+      SELECT
+        targetId,
+        targetName,
+        serverName,
+        port,
+        databaseName,
+        userId,
+        encrypt,
+        trustServerCertificate
+      FROM [DBA_Monitoring].[dbo].[MonitoringServerList]
+      WHERE targetId IS NOT NULL
+        AND targetId <> 'default'
+    `);
+
+    for (const row of result.recordset) {
+      const id = String(row.targetId ?? '').trim();
+      if (!id || targets.has(id)) {
+        continue;
+      }
+
+      const connectionString = buildConnectionString({
+        server: String(row.serverName ?? '').trim(),
+        port: Number.isFinite(Number(row.port)) && Number(row.port) > 0 ? Number(row.port) : env.DB_PORT,
+        database: String(row.databaseName ?? env.DB_NAME).trim(),
+        userId: String(row.userId ?? env.DB_USER).trim(),
+        password: env.DB_PASSWORD,
+        encrypt: Boolean(row.encrypt),
+        trustServerCertificate: Boolean(row.trustServerCertificate)
+      });
+
+      targets.set(id, {
+        id,
+        name: String(row.targetName ?? id).trim() || id,
+        connectionString,
+        createdAt: new Date().toISOString()
+      });
+    }
+  } catch {
+    // Recovery from monitoring table is best-effort only.
+  } finally {
+    if (pool) {
+      await pool.close();
+    }
+  }
+};
+
 const persistTargets = async (): Promise<void> => {
   await ensureStoreDirectory();
 
@@ -288,6 +348,10 @@ const hydrateTargets = async (): Promise<void> => {
         connectionString: defaultConnectionString,
         createdAt: new Date().toISOString()
       });
+    }
+
+    if (targets.size <= 1) {
+      await recoverTargetsFromMonitoringServerList();
     }
 
     if (typeof parsed.activeTargetId === 'string' && targets.has(parsed.activeTargetId)) {

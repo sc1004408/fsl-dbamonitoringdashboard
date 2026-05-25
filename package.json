@@ -12,7 +12,8 @@
     "build": "npm run build -w apps/backend && npm run build -w apps/frontend",
     "start": "npm run start -w apps/backend",
     "lint": "npm run lint -w apps/backend && npm run lint -w apps/frontend",
-    "test": "npm run test -w apps/backend"
+    "test": "npm run test -w apps/backend",
+    "migrate": "npm run migrate -w apps/backend"
   },
   "dependencies": {
     "mssql": "^12.5.4",

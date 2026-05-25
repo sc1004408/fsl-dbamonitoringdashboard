@@ -1,5 +1,26 @@
+let clientTabId = '';
+export const setClientTabId = (tabId) => {
+    clientTabId = tabId;
+};
+const getAuthHeaders = () => {
+    const token = localStorage.getItem('token');
+    if (!token) {
+        return {};
+    }
+    const headers = {
+        Authorization: `Bearer ${token}`
+    };
+    if (clientTabId) {
+        headers['X-Client-Tab-Id'] = clientTabId;
+    }
+    return headers;
+};
 const jsonGet = async (url) => {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+        headers: {
+            ...getAuthHeaders()
+        }
+    });
     if (!response.ok) {
         throw new Error(`API failed for ${url}`);
     }
@@ -9,7 +30,8 @@ const jsonPost = async (url, body) => {
     const response = await fetch(url, {
         method: 'POST',
         headers: {
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            ...getAuthHeaders()
         },
         body: JSON.stringify(body)
     });
@@ -25,7 +47,8 @@ const jsonPut = async (url, body) => {
     const response = await fetch(url, {
         method: 'PUT',
         headers: {
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
+            ...getAuthHeaders()
         },
         body: JSON.stringify(body)
     });
@@ -35,7 +58,11 @@ const jsonPut = async (url, body) => {
     return response.json();
 };
 const downloadGet = async (url) => {
-    const response = await fetch(url);
+    const response = await fetch(url, {
+        headers: {
+            ...getAuthHeaders()
+        }
+    });
     if (!response.ok) {
         throw new Error(`API failed for ${url}`);
     }
@@ -95,7 +122,46 @@ export const api = {
     },
     monitoringStats: () => jsonGet('/api/admin/monitoring-stats'),
     security: (targetId) => jsonGet(withTarget('/api/security', targetId)),
-    deleteTarget: (targetId) => fetch(`/api/targets/${encodeURIComponent(targetId)}`, { method: 'DELETE' }).then((res) => {
+    listUsers: () => jsonGet('/api/users'),
+    presenceHeartbeat: (tabId) => fetch('/api/presence/heartbeat', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...getAuthHeaders()
+        },
+        body: JSON.stringify({ tabId })
+    }).then((res) => {
+        if (!res.ok && res.status !== 204)
+            throw new Error('Failed to update presence');
+    }),
+    presenceClose: (tabId, keepalive = false) => fetch('/api/presence/close', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...getAuthHeaders()
+        },
+        body: JSON.stringify({ tabId }),
+        keepalive
+    }).then((res) => {
+        if (!res.ok && res.status !== 204)
+            throw new Error('Failed to close presence');
+    }),
+    createUser: (username, password, role) => jsonPost('/api/users', { username, password, role }),
+    deleteUser: (userId) => fetch(`/api/users/${encodeURIComponent(String(userId))}`, {
+        method: 'DELETE',
+        headers: {
+            ...getAuthHeaders()
+        }
+    }).then((res) => {
+        if (!res.ok)
+            throw new Error('Failed to delete user');
+    }),
+    deleteTarget: (targetId) => fetch(`/api/targets/${encodeURIComponent(targetId)}`, {
+        method: 'DELETE',
+        headers: {
+            ...getAuthHeaders()
+        }
+    }).then((res) => {
         if (!res.ok)
             throw new Error('Failed to delete target');
     }),

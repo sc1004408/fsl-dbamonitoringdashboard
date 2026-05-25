@@ -61,6 +61,19 @@ npm run dev
 npm run dev:frontend
 ```
 
+If your PowerShell session cannot resolve `npm`, use explicit `npm.cmd` calls:
+
+```powershell
+& "C:\Program Files\nodejs\npm.cmd" run dev -w apps/backend
+& "C:\Program Files\nodejs\npm.cmd" run dev -w apps/frontend
+```
+
+Or use the Windows helper script from repo root:
+
+```powershell
+.\start-dev.cmd
+```
+
 - Backend API: `http://localhost:4000/api/ping`
 - Frontend: `http://localhost:5173`
 

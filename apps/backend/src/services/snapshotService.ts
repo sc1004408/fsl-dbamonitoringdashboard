@@ -1,5 +1,5 @@
 // --- Scheduler for periodic monitoring snapshot collection ---
-import { monitoringService } from './monitoringService';
+import { monitoringService, pleAndSuggestionsService } from './monitoringService';
 import { setInterval } from 'timers';
 
 // Collect and save monitoring data for all targets every 10 minutes
@@ -10,9 +10,10 @@ async function collectAndSaveAllTargetsSnapshot() {
     const now = new Date();
     for (const target of serverState.targets) {
       try {
-        const [health, performance, storage, sessions, queries, alerts, backups] = await Promise.all([
+        const [health, performance, ple, storage, sessions, queries, alerts, backups] = await Promise.all([
           monitoringService.health(target.id),
           monitoringService.performance(target.id),
+          pleAndSuggestionsService.ple(target.id),
           monitoringService.storage(target.id),
           monitoringService.sessions(target.id),
           monitoringService.topQueries(target.id),
@@ -24,6 +25,7 @@ async function collectAndSaveAllTargetsSnapshot() {
           targetId: target.id,
           health,
           performance,
+          ple,
           storage,
           sessions,
           queries,
@@ -53,6 +55,7 @@ export type DashboardSnapshot = {
   targetId: string;
   health: unknown;
   performance: unknown;
+  ple: unknown;
   storage: unknown;
   sessions: unknown;
   queries: unknown;
@@ -66,6 +69,7 @@ export type SnapshotHistoryRow = {
   targetId: string;
   health: unknown;
   performance: unknown;
+  ple: unknown;
   storage: unknown;
   sessions: unknown;
   queries: unknown;
@@ -175,6 +179,7 @@ const ensureMonitoringTables = async (pool: sql.ConnectionPool) => {
         targetId NVARCHAR(100) NOT NULL,
         health NVARCHAR(MAX) NOT NULL,
         performance NVARCHAR(MAX) NOT NULL,
+        ple NVARCHAR(MAX) NOT NULL,
         storage NVARCHAR(MAX) NOT NULL,
         sessions NVARCHAR(MAX) NOT NULL,
         queries NVARCHAR(MAX) NOT NULL,
@@ -185,6 +190,12 @@ const ensureMonitoringTables = async (pool: sql.ConnectionPool) => {
 
       CREATE INDEX IX_DashboardSnapshots_CapturedAt ON ${SNAPSHOT_TABLE}(capturedAt DESC);
       CREATE INDEX IX_DashboardSnapshots_TargetId ON ${SNAPSHOT_TABLE}(targetId);
+    END
+
+    IF COL_LENGTH('${SNAPSHOT_TABLE}', 'ple') IS NULL
+    BEGIN
+      ALTER TABLE ${SNAPSHOT_TABLE}
+      ADD ple NVARCHAR(MAX) NOT NULL CONSTRAINT DF_DashboardSnapshots_ple DEFAULT ('[]');
     END
 
     IF OBJECT_ID('${SERVER_LIST_TABLE}', 'U') IS NULL
@@ -299,6 +310,7 @@ export async function saveDashboardSnapshot(snapshot: DashboardSnapshot) {
   const detailRows = [
     ...flattenSection('health', snapshot.health),
     ...flattenSection('performance', snapshot.performance),
+    ...flattenSection('ple', snapshot.ple),
     ...flattenSection('storage', snapshot.storage),
     ...flattenSection('sessions', snapshot.sessions),
     ...flattenSection('queries', snapshot.queries),
@@ -338,14 +350,15 @@ export async function saveDashboardSnapshot(snapshot: DashboardSnapshot) {
     .input('targetId', sql.NVarChar(100), snapshot.targetId)
     .input('health', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.health))
     .input('performance', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.performance))
+    .input('ple', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.ple))
     .input('storage', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.storage))
     .input('sessions', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.sessions))
     .input('queries', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.queries))
     .input('alerts', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.alerts))
     .input('backups', sql.NVarChar(sql.MAX), JSON.stringify(snapshot.backups))
     .query(`INSERT INTO ${SNAPSHOT_TABLE}
-      (capturedAt, targetId, health, performance, storage, sessions, queries, alerts, backups)
-      VALUES (@capturedAt, @targetId, @health, @performance, @storage, @sessions, @queries, @alerts, @backups)`);
+      (capturedAt, targetId, health, performance, ple, storage, sessions, queries, alerts, backups)
+      VALUES (@capturedAt, @targetId, @health, @performance, @ple, @storage, @sessions, @queries, @alerts, @backups)`);
 
   await purgeOldMonitoringData(pool, 60);
 }
@@ -369,6 +382,7 @@ const mapSnapshotRows = (rows: Array<Record<string, unknown>>): SnapshotHistoryR
     targetId: String(row.targetId),
     health: parseJsonField(row.health),
     performance: parseJsonField(row.performance),
+    ple: parseJsonField(row.ple),
     storage: parseJsonField(row.storage),
     sessions: parseJsonField(row.sessions),
     queries: parseJsonField(row.queries),
@@ -394,6 +408,7 @@ export async function getDashboardSnapshots(filter: SnapshotHistoryFilter): Prom
       targetId,
       health,
       performance,
+      ple,
       storage,
       sessions,
       queries,
@@ -442,6 +457,7 @@ export async function getAllDashboardSnapshots(filter: SnapshotHistoryFilter): P
         targetId,
         health,
         performance,
+        ple,
         storage,
         sessions,
         queries,

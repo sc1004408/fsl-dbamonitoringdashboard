@@ -1,8 +1,9 @@
-﻿import { FormEvent, Fragment, useEffect, useMemo, useRef, useState } from 'react';
+﻿import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AIModePanel } from './components/AIModePanel';
 import { MetricCard } from './components/MetricCard';
 import { MiniBarChart } from './components/MiniBarChart';
-import { api, BackupInfo, ConnectionPayload, DbTarget, MonitoringTableStats, SecurityData, SnapshotHistoryItem } from './services/api';
+import { AdminUser, api, BackupInfo, ConnectionPayload, DbTarget, MonitoringTableStats, SecurityData, setClientTabId, SnapshotHistoryItem } from './services/api';
 
 type ConnectionFormFields = {
  server: string;
@@ -52,6 +53,9 @@ type TopicKey =
  | 'suggestions'
  | 'history'
  | 'security';
+
+type ExportMenuContext = 'none' | 'live' | 'topic-history' | 'audit-history';
+type ExportFormat = 'csv' | 'excel' | 'pdf';
 
 const defaultConnectionFields: ConnectionFormFields = {
  server: '',
@@ -159,6 +163,32 @@ const asLooseArray = (value: unknown): LooseRecord[] => {
  return value.filter(isLooseRecord);
 };
 
+const normalizePleHistoryValue = (value: unknown): Array<{ node_name: string; page_life_expectancy: number | string }> => {
+ if (Array.isArray(value)) {
+ return value
+ .filter(isLooseRecord)
+ .map((row) => ({
+ node_name: String(row.node_name ?? '-'),
+ page_life_expectancy: Number.isFinite(Number(row.page_life_expectancy))
+ ? Number(row.page_life_expectancy)
+ : String(row.page_life_expectancy ?? '-')
+ }));
+ }
+
+ if (isLooseRecord(value) && Array.isArray(value.value)) {
+ return value.value
+ .filter(isLooseRecord)
+ .map((row) => ({
+ node_name: String(row.node_name ?? '-'),
+ page_life_expectancy: Number.isFinite(Number(row.page_life_expectancy))
+ ? Number(row.page_life_expectancy)
+ : String(row.page_life_expectancy ?? '-')
+ }));
+ }
+
+ return [];
+};
+
 const toNumber = (value: unknown): number => {
  const parsed = typeof value === 'number' ? value : Number(value);
  return Number.isFinite(parsed) ? parsed : 0;
@@ -203,10 +233,101 @@ const shortText = (value: unknown, maxLength = 100): string => {
  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 };
 
+const readAuthContext = (): { id: number; username: string; role: 'admin' | 'reader' | null } => {
+ const token = localStorage.getItem('token');
+ if (!token) {
+ return { id: 0, username: '', role: null };
+ }
+
+ try {
+ const payloadPart = token.split('.')[1];
+ if (!payloadPart) {
+ return { id: 0, username: '', role: null };
+ }
+
+ const normalized = payloadPart.replace(/-/g, '+').replace(/_/g, '/');
+ const decoded = JSON.parse(atob(normalized));
+ const role = decoded?.role === 'reader' ? 'reader' : decoded?.role === 'admin' ? 'admin' : null;
+ return {
+ id: Number(decoded?.sub ?? 0),
+ username: typeof decoded?.username === 'string' ? decoded.username : '',
+ role
+ };
+ } catch {
+ return { id: 0, username: '', role: null };
+ }
+};
+
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+const INACTIVITY_TIMEOUT_SECONDS = Math.floor(INACTIVITY_TIMEOUT_MS / 1000);
+
+const formatCountdown = (seconds: number): string => {
+ const safe = Math.max(0, seconds);
+ const mins = Math.floor(safe / 60);
+ const secs = safe % 60;
+ return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+};
+
 
 
 export const App = () => {
+ const navigate = useNavigate();
+ const inactivityTimerRef = useRef<number | null>(null);
+ const inactivityDeadlineRef = useRef<number | null>(null);
+ const countdownIntervalRef = useRef<number | null>(null);
+ const tabIdRef = useRef<string>('');
+ const userMenuRef = useRef<HTMLDivElement | null>(null);
+ const authContext = useMemo(() => readAuthContext(), []);
  const [data, setData] = useState<DataState>(initialState);
+ const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
+ const [adminLoading, setAdminLoading] = useState(false);
+ const [showAdminConsole, setShowAdminConsole] = useState(false);
+ const [showCreateUserForm, setShowCreateUserForm] = useState(false);
+ const [showAdminUsers, setShowAdminUsers] = useState(false);
+ const [adminUsersLoaded, setAdminUsersLoaded] = useState(false);
+ const [adminMessage, setAdminMessage] = useState('');
+ const [inactivityRemainingSeconds, setInactivityRemainingSeconds] = useState(INACTIVITY_TIMEOUT_SECONDS);
+ const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+ const [newUsername, setNewUsername] = useState('');
+ const [newUserPassword, setNewUserPassword] = useState('');
+ const [newUserRole, setNewUserRole] = useState<'admin' | 'reader'>('reader');
+
+ const getTabId = () => {
+ if (tabIdRef.current) {
+ return tabIdRef.current;
+ }
+
+ const storageKey = 'db-monitoring-tab-id';
+ let tabId = sessionStorage.getItem(storageKey);
+ if (!tabId) {
+ tabId = typeof crypto.randomUUID === 'function'
+ ? crypto.randomUUID()
+ : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+ sessionStorage.setItem(storageKey, tabId);
+ }
+
+ tabIdRef.current = tabId;
+ setClientTabId(tabId);
+ return tabId;
+ };
+
+ const handleLogout = useCallback(() => {
+ const tabId = tabIdRef.current || sessionStorage.getItem('db-monitoring-tab-id');
+ if (tabId) {
+ void api.presenceClose(tabId, true);
+ }
+ localStorage.removeItem('token');
+ navigate('/login');
+ }, [navigate]);
+
+ const handleUserMenuToggle = () => {
+ setIsUserMenuOpen((current) => !current);
+ };
+
+ const handleUserMenuLogout = () => {
+ setIsUserMenuOpen(false);
+ handleLogout();
+ };
  const [targets, setTargets] = useState<DbTarget[]>([]);
  const [selectedTargetId, setSelectedTargetId] = useState('');
  const [showTopicPane, setShowTopicPane] = useState(false);
@@ -238,13 +359,14 @@ export const App = () => {
  const [selectedTopic, setSelectedTopic] = useState<TopicKey | null>('health');
  const [showHistoryView, setShowHistoryView] = useState<{ topic: TopicKey | null }>({ topic: null });
  const [topicHistory, setTopicHistory] = useState<Array<{ id: number; capturedAt: string; value: unknown }>>([]);
- const [pleData, setPleData] = useState<{ node_id: number; page_life_expectancy: number }[]>([]);
+const [pleData, setPleData] = useState<{ node_name: string; page_life_expectancy: number }[]>([]);
  const [pleHourlyBars, setPleHourlyBars] = useState<BarDatum[]>([]);
  const [suggestionsData, setSuggestionsData] = useState<{ missingIndexes: any[]; fragmentedIndexes: any[] }>({ missingIndexes: [], fragmentedIndexes: [] });
  const [copiedKey, setCopiedKey] = useState<string | null>(null);
  const [showSuccessBackups, setShowSuccessBackups] = useState(false);
  const [securityData, setSecurityData] = useState<SecurityData | null>(null);
  const [securityLoading, setSecurityLoading] = useState(false);
+ const [exportMenuContext, setExportMenuContext] = useState<ExportMenuContext>('none');
  const firstFieldRef = useRef<HTMLInputElement | null>(null);
 
  const selectedTarget = useMemo(
@@ -388,6 +510,24 @@ export const App = () => {
  }
  };
 
+ const loadAdminUsers = async () => {
+ if (authContext.role !== 'admin') {
+ return;
+ }
+
+ setAdminLoading(true);
+ try {
+ const users = await api.listUsers();
+ setAdminUsers(users);
+ setAdminUsersLoaded(true);
+ } catch {
+ setAdminMessage('Unable to load users.');
+ setAdminUsersLoaded(false);
+ } finally {
+ setAdminLoading(false);
+ }
+ };
+
  useEffect(() => {
  let active = true;
  const loadTargets = async () => {
@@ -405,6 +545,114 @@ export const App = () => {
  void loadTargets();
  return () => {
  active = false;
+ };
+ }, []);
+
+ useEffect(() => {
+ if (authContext.id <= 0) {
+ return;
+ }
+
+ const tabId = getTabId();
+ const sendHeartbeat = () => {
+ void api.presenceHeartbeat(tabId);
+ };
+
+ sendHeartbeat();
+ const intervalId = window.setInterval(sendHeartbeat, 30 * 1000);
+
+ const handlePageHide = () => {
+ void api.presenceClose(tabId, true);
+ };
+
+ window.addEventListener('pagehide', handlePageHide);
+ window.addEventListener('beforeunload', handlePageHide);
+
+ return () => {
+ window.clearInterval(intervalId);
+ window.removeEventListener('pagehide', handlePageHide);
+ window.removeEventListener('beforeunload', handlePageHide);
+ void api.presenceClose(tabId, true);
+ };
+ }, [authContext.id]);
+
+ useEffect(() => {
+ const handleDocumentClick = (event: MouseEvent) => {
+ const target = event.target as Node | null;
+ if (!userMenuRef.current || !target) {
+ return;
+ }
+
+ if (!userMenuRef.current.contains(target)) {
+ setIsUserMenuOpen(false);
+ }
+ };
+
+ document.addEventListener('click', handleDocumentClick);
+ return () => {
+ document.removeEventListener('click', handleDocumentClick);
+ };
+ }, []);
+
+ useEffect(() => {
+ const updateCountdown = () => {
+ const deadline = inactivityDeadlineRef.current;
+ if (!deadline) {
+ setInactivityRemainingSeconds(INACTIVITY_TIMEOUT_SECONDS);
+ return;
+ }
+
+ const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+ setInactivityRemainingSeconds(remaining);
+ };
+
+ const resetTimer = () => {
+ if (inactivityTimerRef.current) {
+ window.clearTimeout(inactivityTimerRef.current);
+ }
+ inactivityDeadlineRef.current = Date.now() + INACTIVITY_TIMEOUT_MS;
+ updateCountdown();
+ inactivityTimerRef.current = window.setTimeout(() => {
+ handleLogout();
+ }, INACTIVITY_TIMEOUT_MS);
+ };
+
+ const events: Array<keyof DocumentEventMap> = ['click', 'keydown', 'mousemove', 'scroll', 'touchstart'];
+ events.forEach((eventName) => {
+ document.addEventListener(eventName, resetTimer, { passive: true });
+ });
+
+ resetTimer();
+ countdownIntervalRef.current = window.setInterval(updateCountdown, 1000);
+
+ return () => {
+ if (inactivityTimerRef.current) {
+ window.clearTimeout(inactivityTimerRef.current);
+ }
+ if (countdownIntervalRef.current) {
+ window.clearInterval(countdownIntervalRef.current);
+ }
+ events.forEach((eventName) => {
+ document.removeEventListener(eventName, resetTimer);
+ });
+ };
+ }, [handleLogout]);
+
+ useEffect(() => {
+ const handleDocumentClick = (event: MouseEvent) => {
+ const target = event.target as HTMLElement | null;
+ if (!target) {
+ return;
+ }
+
+ if (!target.closest('.export-menu-wrap')) {
+ setExportMenuContext('none');
+ }
+ };
+
+ document.addEventListener('click', handleDocumentClick);
+ return () => {
+ document.removeEventListener('click', handleDocumentClick);
  };
  }, []);
 
@@ -563,10 +811,13 @@ export const App = () => {
  const handleSaveSnapshot = async () => {
  if (!selectedTargetId) return;
  try {
+ const pleSnapshotRows = await api.ple(selectedTargetId);
+ setPleData(pleSnapshotRows);
  await api.saveSnapshot({
  targetId: selectedTargetId,
  health: data.health,
  performance: data.performance,
+ ple: pleSnapshotRows,
  storage: data.storage,
  sessions: data.sessions,
  queries: data.queries,
@@ -615,7 +866,9 @@ export const App = () => {
  response.items.map((row) => ({
  id: row.id,
  capturedAt: row.capturedAt,
- value: (row as unknown as Record<string, unknown>)[topic as string]
+ value: topic === 'ple'
+ ? normalizePleHistoryValue((row as unknown as Record<string, unknown>).ple)
+ : (row as unknown as Record<string, unknown>)[topic as string]
  }))
  );
  setHistoryTotal(response.total);
@@ -750,6 +1003,179 @@ export const App = () => {
  downloadBlob(blob, `${exportFilenamePrefix}.csv`);
  } catch {
  setTargetMessage('Unable to export snapshot history CSV.');
+ }
+ };
+
+const exportSnapshotsExcel = async () => {
+try {
+const blob = await api.exportSnapshots({
+targetId: selectedTargetId || undefined,
+from: historyFrom || undefined,
+to: historyTo || undefined,
+format: 'excel'
+});
+downloadBlob(blob, `${exportFilenamePrefix}.xlsx`);
+} catch {
+setTargetMessage('Unable to export snapshot history Excel.');
+}
+};
+
+const exportSnapshotsByFormat = async (format: ExportFormat, includeHistoryRange: boolean) => {
+ try {
+ const blob = await api.exportSnapshots({
+ targetId: selectedTargetId || undefined,
+ from: includeHistoryRange ? (historyFrom || undefined) : undefined,
+ to: includeHistoryRange ? (historyTo || undefined) : undefined,
+ format
+ });
+
+ const extension = format === 'excel' ? 'xlsx' : format;
+ downloadBlob(blob, `${exportFilenamePrefix}.${extension}`);
+ setExportMenuContext('none');
+ } catch {
+ setTargetMessage(`Unable to export snapshot history ${format.toUpperCase()}.`);
+ }
+};
+
+const renderExportMenu = (context: Exclude<ExportMenuContext, 'none'>, includeHistoryRange: boolean) => {
+ const isOpen = exportMenuContext === context;
+ return (
+ <div className="export-menu-wrap" style={{ position: 'relative', display: 'inline-block' }}>
+ <button
+ type="button"
+ onClick={(event) => {
+ event.stopPropagation();
+ setExportMenuContext((current) => current === context ? 'none' : context);
+ }}
+ disabled={historyLoading}
+ >
+ Export
+ </button>
+ {isOpen && (
+ <div
+ style={{
+ position: 'absolute',
+ top: 'calc(100% + 4px)',
+ right: 0,
+ minWidth: 140,
+ background: '#fff',
+ border: '1px solid #d0d5dd',
+ borderRadius: 8,
+ boxShadow: '0 8px 24px rgba(15, 23, 42, 0.15)',
+ padding: 6,
+ zIndex: 15
+ }}
+ >
+ <button type="button" style={{ width: '100%', textAlign: 'left', marginBottom: 4 }} onClick={() => void exportSnapshotsByFormat('csv', includeHistoryRange)}>CSV</button>
+ <button type="button" style={{ width: '100%', textAlign: 'left', marginBottom: 4 }} onClick={() => void exportSnapshotsByFormat('pdf', includeHistoryRange)}>PDF</button>
+ <button type="button" style={{ width: '100%', textAlign: 'left' }} onClick={() => void exportSnapshotsByFormat('excel', includeHistoryRange)}>EXCEL</button>
+ </div>
+ )}
+ </div>
+ );
+};
+
+const exportSnapshotsPdf = async () => {
+try {
+const blob = await api.exportSnapshots({
+targetId: selectedTargetId || undefined,
+from: historyFrom || undefined,
+to: historyTo || undefined,
+format: 'pdf'
+});
+downloadBlob(blob, `${exportFilenamePrefix}.pdf`);
+} catch {
+setTargetMessage('Unable to export snapshot history PDF.');
+}
+};
+
+ const handleCreateUser = async (event: FormEvent) => {
+ event.preventDefault();
+ if (!newUsername.trim() || !newUserPassword) {
+ setAdminMessage('Enter username and password to create user.');
+ return;
+ }
+
+ setAdminLoading(true);
+ setAdminMessage('');
+ try {
+ await api.createUser(newUsername.trim(), newUserPassword, newUserRole);
+ setNewUsername('');
+ setNewUserPassword('');
+ setNewUserRole('reader');
+ if (showAdminUsers) {
+ await loadAdminUsers();
+ setAdminMessage('User created successfully.');
+ } else {
+ setAdminUsersLoaded(false);
+ setAdminMessage('User created. Click Load Principals to view the updated list.');
+ }
+ } catch {
+ setAdminMessage('Unable to create user.');
+ } finally {
+ setAdminLoading(false);
+ }
+ };
+
+ const resetCreateUserForm = () => {
+ setNewUsername('');
+ setNewUserPassword('');
+ setNewUserRole('reader');
+ };
+
+ const handleToggleCreateUserForm = () => {
+ const nextVisible = !showCreateUserForm;
+ setShowCreateUserForm(nextVisible);
+ if (!nextVisible) {
+ resetCreateUserForm();
+ }
+ };
+
+ const handleToggleAdminUsers = async () => {
+ const nextVisible = !showAdminUsers;
+ setShowAdminUsers(nextVisible);
+
+ if (nextVisible && !adminUsersLoaded) {
+ setAdminMessage('');
+ await loadAdminUsers();
+ }
+ };
+
+ const handleToggleAdminConsole = () => {
+ const nextVisible = !showAdminConsole;
+ setShowAdminConsole(nextVisible);
+ if (!nextVisible) {
+ setShowCreateUserForm(false);
+ setShowAdminUsers(false);
+ setAdminMessage('');
+ resetCreateUserForm();
+ }
+ };
+
+ const handleDeleteUser = async (userId: number, username: string) => {
+ if (username === authContext.username) {
+ setAdminMessage('You cannot delete your own account.');
+ return;
+ }
+
+ if (!window.confirm(`Delete user ${username}?`)) {
+ return;
+ }
+
+ setAdminLoading(true);
+ setAdminMessage('');
+ try {
+ await api.deleteUser(userId);
+ if (showAdminUsers) {
+ await loadAdminUsers();
+ } else {
+ setAdminUsersLoaded(false);
+ }
+ setAdminMessage('User deleted successfully.');
+ } catch {
+ setAdminMessage('Unable to delete user.');
+ } finally {
+ setAdminLoading(false);
  }
  };
 
@@ -986,19 +1412,19 @@ export const App = () => {
  };
 
  // Hide AI Mode topic by not including it in the topicItems array
- const topicItems: Array<{ id: TopicKey; label: string }> = [
- { id: 'health', label: 'Instance Health Overview' },
- { id: 'cpuMemory', label: 'Host Resource Utilization' },
- { id: 'performance', label: 'Wait Statistics & Requests' },
- { id: 'storage', label: 'Database Storage Capacity' },
- { id: 'sessions', label: 'Session Activity & Control' },
- { id: 'queries', label: 'Query Performance Analysis' },
- { id: 'alerts', label: 'Operational Alerts & Incidents' },
- { id: 'backups', label: 'Backup Compliance Status' },
- { id: 'ple', label: 'Buffer Cache PLE Analysis' },
- { id: 'suggestions', label: 'Recommendations' },
- { id: 'security', label: 'Security & Access Control' },
- { id: 'history', label: 'Monitoring Snapshot Audit' }
+ const topicItems: Array<{ id: TopicKey; label: string; code: string }> = [
+ { id: 'health', label: 'Instance Health Check', code: 'HLT' },
+ { id: 'cpuMemory', label: 'Host CPU & Memory', code: 'CPU' },
+ { id: 'performance', label: 'Waits, Latches & Requests', code: 'WTR' },
+ { id: 'storage', label: 'Data & Log Capacity', code: 'STG' },
+ { id: 'sessions', label: 'SPID Activity & Kill Control', code: 'SES' },
+ { id: 'queries', label: 'Top SQL & Execution Trends', code: 'SQL' },
+ { id: 'alerts', label: 'Incidents & Alert Conditions', code: 'ALT' },
+ { id: 'backups', label: 'Backup & Recovery SLA', code: 'BKP' },
+ { id: 'ple', label: 'Buffer Cache Health (PLE)', code: 'PLE' },
+ { id: 'suggestions', label: 'Index & Tuning Suggestions', code: 'TUN' },
+ { id: 'security', label: 'Principals, Roles & Permissions', code: 'SEC' },
+ { id: 'history', label: 'Snapshot Audit Trail', code: 'AUD' }
  ];
  // Fetch topic-specific data when selected topic changes.
  useEffect(() => {
@@ -1041,25 +1467,47 @@ export const App = () => {
  <main className="shell">
  <header className="hero">
  <p className="tag">Enterprise SQL Server Monitoring for DBAs</p>
- <h1>Professional SQL Server DBA Operations Console</h1>
+ <h1>SQL Server DBA Operations Console</h1>
  <div className="hero-row">
  <span className="status">Status: {statusLabel}</span>
- <button onClick={() => void refreshAll(selectedTargetId)} disabled={!selectedTargetId}>Refresh Snapshot</button>
- <button onClick={() => void handleSaveSnapshot()} disabled={!selectedTargetId} title="Save current dashboard data to DBA_Monitoring database">Save Snapshot</button>
+ <span className="status idle-timer">Auto logout in {formatCountdown(inactivityRemainingSeconds)}</span>
+ <button onClick={() => void refreshAll(selectedTargetId)} disabled={!selectedTargetId}>Refresh Telemetry</button>
+ <button onClick={() => void handleSaveSnapshot()} disabled={!selectedTargetId} title="Persist current telemetry set to DBA_Monitoring">Persist Snapshot</button>
+ {authContext.role === 'admin' && (
+ <button type="button" onClick={handleToggleAdminConsole}>
+ {showAdminConsole ? 'Hide Principals Console' : 'Open Principals Console'}
+ </button>
+ )}
+ <div className="user-menu" ref={userMenuRef}>
+ <button type="button" className="user-menu-trigger" onClick={handleUserMenuToggle}>
+ <span className="user-icon" aria-hidden="true">
+ <svg viewBox="0 0 24 24" className="user-icon-svg" focusable="false" aria-hidden="true">
+ <path fill="currentColor" d="M12 12a4.5 4.5 0 1 0-4.5-4.5A4.5 4.5 0 0 0 12 12Zm0 2.25c-3.38 0-6.75 1.69-6.75 5.06a.94.94 0 0 0 .94.94h11.62a.94.94 0 0 0 .94-.94c0-3.37-3.37-5.06-6.75-5.06Z" />
+ </svg>
+ </span>
+ <span className="user-name">{authContext.username || 'DBA User'}</span>
+ <span className="user-caret" aria-hidden="true">▾</span>
+ </button>
+ {isUserMenuOpen && (
+ <div className="user-menu-dropdown">
+ <button type="button" className="user-menu-item" onClick={handleUserMenuLogout}>Logout</button>
+ </div>
+ )}
+ </div>
  </div>
 
  <section className="target-panel">
  <div className="target-row">
- <label htmlFor="target-select">DB Server</label>
+ <label htmlFor="target-select">SQL Instance</label>
  <select id="target-select" value={selectedTargetId} onChange={(event) => void handleSelectTarget(event.target.value)}>
  {targets.map((target) => (
  <option key={target.id} value={target.id}>{target.name}</option>
  ))}
  </select>
- <button type="button" onClick={() => setShowTopicPane(false)} style={{ marginRight: 8 }}>Home</button>
- <button type="button" onClick={openAddForm}>Add Target</button>
- <button type="button" onClick={openEditForm} disabled={!selectedTargetId}>Edit Target</button>
- <button type="button" onClick={() => void handleRemoveTarget()} disabled={!selectedTargetId || selectedTargetId === 'default'} style={{ marginLeft: 8, color: 'red' }}>Remove Target</button>
+ <button type="button" onClick={() => setShowTopicPane(false)} style={{ marginRight: 8 }}>Executive View</button>
+ <button type="button" onClick={openAddForm}>Register Instance</button>
+ <button type="button" onClick={openEditForm} disabled={!selectedTargetId}>Edit Instance</button>
+ <button type="button" onClick={() => void handleRemoveTarget()} disabled={!selectedTargetId || selectedTargetId === 'default'} style={{ marginLeft: 8, color: 'red' }}>Decommission Instance</button>
  </div>
 
  {formMode && (
@@ -1080,12 +1528,90 @@ export const App = () => {
  {selectedTarget && <p className="target-meta">Active: {selectedTarget.connectionStringMasked}</p>}
  {targetMessage && <p className="target-message">{targetMessage}</p>}
  </section>
+
+ {authContext.role === 'admin' && showAdminConsole && (
+ <section className="target-panel admin-console" style={{ marginTop: 10 }}>
+ <h3 style={{ marginTop: 0 }}>DBA Administration Console: Principals</h3>
+ <div className="admin-actions-row">
+ <button type="button" onClick={handleToggleCreateUserForm} disabled={adminLoading}>
+ {showCreateUserForm ? 'Hide Create User' : 'Create User'}
+ </button>
+ <button type="button" onClick={() => void handleToggleAdminUsers()} disabled={adminLoading}>
+ {showAdminUsers ? 'Hide Principals' : 'Load Principals'}
+ </button>
+ {showAdminUsers && (
+ <button type="button" onClick={() => void loadAdminUsers()} disabled={adminLoading}>
+ Refresh Principals
+ </button>
+ )}
+ </div>
+ {showCreateUserForm && (
+ <form className="target-add-row admin-form" onSubmit={(event) => void handleCreateUser(event)}>
+ <input type="text" placeholder="Login name" value={newUsername} onChange={(event) => setNewUsername(event.target.value)} />
+ <input type="password" placeholder="Password" value={newUserPassword} onChange={(event) => setNewUserPassword(event.target.value)} />
+ <select value={newUserRole} onChange={(event) => setNewUserRole(event.target.value as 'admin' | 'reader')}>
+ <option value="reader">reader</option>
+ <option value="admin">admin</option>
+ </select>
+ <button type="submit" disabled={adminLoading}>{adminLoading ? 'Saving...' : 'Create Principal'}</button>
+ <button type="button" onClick={resetCreateUserForm} disabled={adminLoading}>Reset Fields</button>
+ </form>
+ )}
+ {adminMessage && <p className="target-message">{adminMessage}</p>}
+ {!showAdminUsers && <p className="target-message">Principal list is hidden. Click Load Principals to populate it.</p>}
+ {showAdminUsers && (
+ <div className="metric-scroll admin-user-table" style={{ marginTop: 8 }}>
+ <table className="backup-table compact-table">
+ <thead>
+ <tr>
+ <th>Principal ID</th>
+ <th>Login Name</th>
+ <th>Access Role</th>
+ <th>Session Status</th>
+ <th>Open Tabs</th>
+ <th>Last Active</th>
+ <th>Created (UTC)</th>
+ <th>Operation</th>
+ </tr>
+ </thead>
+ <tbody>
+ {adminUsers.length > 0 ? adminUsers.map((user) => (
+ <tr key={user.id}>
+ <td>{user.id}</td>
+ <td>{user.username}</td>
+ <td>{user.role}</td>
+ <td><span className={user.is_active ? 'status-ok' : 'status-warn'}>{user.is_active ? 'Active' : 'Offline'}</span></td>
+ <td>{user.active_tab_count ?? 0}</td>
+ <td>{user.last_active_at ? new Date(user.last_active_at).toLocaleString() : '-'}</td>
+ <td>{user.created_at ? new Date(user.created_at).toLocaleString() : '-'}</td>
+ <td>
+ <button
+ type="button"
+ onClick={() => void handleDeleteUser(user.id, user.username)}
+ disabled={adminLoading || user.username === authContext.username}
+ className="btn-danger"
+ >
+ Drop
+ </button>
+ </td>
+ </tr>
+ )) : (
+ <tr>
+ <td colSpan={8}>{adminLoading ? 'Loading principals...' : 'No principals found'}</td>
+ </tr>
+ )}
+ </tbody>
+ </table>
+ </div>
+ )}
+ </section>
+ )}
  </header>
 
  {!showTopicPane && (
  <section className="ai-panel" style={{ marginTop: 0 }}>
- <h2>Home: SQL Server Instance Health Overview</h2>
- <p>Select a DB server to open the full topic pane and detailed monitoring reports.</p>
+ <h2>Executive Overview: SQL Estate Health</h2>
+ <p>Select an instance to open topic-specific DBA analytics and operational controls.</p>
  <div className="metric-scroll" style={{ marginTop: 8, marginBottom: 8 }}>
  <table className="backup-table compact-table">
  <thead>
@@ -1108,7 +1634,7 @@ export const App = () => {
  <td>{formatNumber(monitoringStats.dashboardSnapshotCount)}</td>
  <td>{monitoringStats.oldestSnapshotAt ? new Date(monitoringStats.oldestSnapshotAt).toLocaleString() : '-'}</td>
  <td>{monitoringStats.newestSnapshotAt ? new Date(monitoringStats.newestSnapshotAt).toLocaleString() : '-'}</td>
- <td>{formatNumber(monitoringStats.retentionDays)}{monitoringStats.error && <span className="status-warn" title={monitoringStats.error}> ΓÜá DB unavailable</span>}</td>
+ <td>{formatNumber(monitoringStats.retentionDays)}{monitoringStats.error && <span className="status-warn" title={monitoringStats.error}> - repository unavailable</span>}</td>
  </tr>
  ) : (
  <tr>
@@ -1118,19 +1644,19 @@ export const App = () => {
  </tbody>
  </table>
  </div>
- {homeHealthLoading && <p>Loading server health overview...</p>}
+ {homeHealthLoading && <p>Loading SQL instance telemetry...</p>}
  <div className="metric-scroll" style={{ marginTop: 8 }}>
  <table className="backup-table">
  <thead>
  <tr>
- <th>DB Server</th>
- <th>Status</th>
- <th>Instance Name</th>
- <th>Uptime (minutes)</th>
- <th>CPU (%)</th>
- <th>Memory Usage</th>
- <th>Checked At</th>
- <th>Open Reports</th>
+ <th>SQL Instance</th>
+ <th>Availability</th>
+ <th>Host Name</th>
+ <th>Instance Uptime (min)</th>
+ <th>Host CPU %</th>
+ <th>Memory Footprint</th>
+ <th>Last Sample</th>
+ <th>Open Console</th>
  </tr>
  </thead>
  <tbody>
@@ -1148,7 +1674,7 @@ export const App = () => {
  <td>{homeHealth?.checkedAt ? new Date(String(homeHealth.checkedAt)).toLocaleString() : '-'}</td>
  <td>
  <button type="button" onClick={() => void handleSelectTarget(target.id)}>
- Open Report
+ Open Workbook
  </button>
  </td>
  </tr>
@@ -1167,7 +1693,7 @@ export const App = () => {
  {showTopicPane && (
  <section className="topic-layout">
  <aside className="topic-sidebar">
- <h3>Monitoring Topics</h3>
+ <h3>DBA Workbooks</h3>
  <div className="topic-list">
  {topicItems.map((topic) => (
  <button
@@ -1176,6 +1702,7 @@ export const App = () => {
  className={`topic-button${selectedTopic === topic.id ? ' active' : ''}`}
  onClick={() => handleSelectTopic(topic.id)}
  >
+ <span className="topic-code">{topic.code}</span>
  {topic.label}
  </button>
  ))}
@@ -1186,8 +1713,9 @@ export const App = () => {
  {selectedTopic && !showHistoryView.topic && (
  <div className="snapshot-actions" style={{ justifyContent: 'flex-end', marginBottom: 8 }}>
  <button type="button" onClick={() => void refreshCurrentTopic()} disabled={!selectedTargetId || loading || historyLoading || securityLoading}>
- {loading || securityLoading ? 'Refreshing Data...' : 'Refresh Topic Data'}
+ {loading || securityLoading ? 'Refreshing Telemetry...' : 'Refresh Workbook'}
  </button>
+ {renderExportMenu('live', false)}
  </div>
  )}
 
@@ -1209,7 +1737,13 @@ export const App = () => {
  <button onClick={startHistorySearch} disabled={historyLoading}>
  {historyLoading ? 'Loading...' : 'Load History'}
  </button>
+ {renderExportMenu('topic-history', true)}
  </div>
+ </div>
+ <div className="snapshot-actions" style={{ marginTop: 6, opacity: 0.9 }}>
+ <span>Rows: {topicHistory.length}</span>
+ <span>Offset: {historyOffset}</span>
+ <span>Total: {historyTotal}</span>
  </div>
  <table className="backup-table" style={{ marginTop: 12 }}>
  <thead>
@@ -1221,19 +1755,56 @@ export const App = () => {
  </thead>
  <tbody>
  {topicHistory.length > 0 ? (
- topicHistory.map((row) => (
- <tr key={row.id}>
- <td>{row.id}</td>
- <td>{new Date(row.capturedAt).toLocaleString()}</td>
- <td>
- <pre style={{ maxWidth: 700, maxHeight: 220, overflow: 'auto', margin: 0 }}>{JSON.stringify(row.value, null, 2)}</pre>
- </td>
- </tr>
- ))
+	 topicHistory.map((row) => (
+		 <tr key={row.id}>
+			 <td>{row.id}</td>
+			 <td>{new Date(row.capturedAt).toLocaleString()}</td>
+			 <td>
+				 {showHistoryView.topic === 'ple' && Array.isArray(row.value) && row.value.length > 0 ? (
+					 <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
+						 <thead>
+							 <tr>
+								 <th style={{ borderBottom: '1px solid #ccc', textAlign: 'left', paddingRight: 8 }}>Node</th>
+								 <th style={{ borderBottom: '1px solid #ccc', textAlign: 'left', paddingRight: 8 }}>PLE (sec)</th>
+							 </tr>
+						 </thead>
+						 <tbody>
+							 {row.value.map((ple, idx) => (
+								 <tr key={ple.node_name || idx}>
+									 <td>{ple.node_name ?? '-'}</td>
+									 <td>{ple.page_life_expectancy ?? '-'}</td>
+								 </tr>
+							 ))}
+						 </tbody>
+					 </table>
+				 ) : showHistoryView.topic === 'ple' ? (
+					 <span style={{ opacity: 0.75 }}>PLE was not captured for this snapshot.</span>
+				 ) : Array.isArray(row.value) ? (
+					 <div>
+						 <div style={{ marginBottom: 6, fontWeight: 600 }}>Array with {row.value.length} item(s)</div>
+						 <pre style={{ maxWidth: 700, maxHeight: 180, overflow: 'auto', margin: 0 }}>{JSON.stringify(row.value, null, 2)}</pre>
+					 </div>
+				 ) : isLooseRecord(row.value) ? (
+					 <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
+						 <tbody>
+							 {Object.entries(row.value).map(([key, val]) => (
+								 <tr key={key}>
+									 <th style={{ textAlign: 'left', width: 220, borderBottom: '1px solid #ddd', paddingRight: 8 }}>{key}</th>
+									 <td style={{ borderBottom: '1px solid #ddd' }}>{typeof val === 'object' ? JSON.stringify(val) : String(val ?? '-')}</td>
+								 </tr>
+							 ))}
+						 </tbody>
+					 </table>
+				 ) : (
+					 <pre style={{ maxWidth: 700, maxHeight: 220, overflow: 'auto', margin: 0 }}>{JSON.stringify(row.value, null, 2)}</pre>
+				 )}
+			 </td>
+		 </tr>
+	 ))
  ) : (
- <tr>
- <td colSpan={3}>No history data found for selected range.</td>
- </tr>
+	 <tr>
+		 <td colSpan={3}>No history data found for selected range.</td>
+	 </tr>
  )}
  </tbody>
  </table>
@@ -2026,35 +2597,63 @@ export const App = () => {
 
  {selectedTopic === 'ple' && !showHistoryView.topic && (
  <MetricCard title="Buffer Cache Page Life Expectancy" titleProps={{ title: 'PLE values by NUMA node and recent trend.' }}>
- <button className="history-btn" style={{ position: 'absolute', top: 16, right: 24, zIndex: 2 }} onClick={() => openHistoryView('ple')}>History View</button>
- <div className="metric-bars" aria-label="PLE Trend">
- <h4>Recent PLE Trend (24h)</h4>
- <MiniBarChart data={pleHourlyBars} height={180} color={["#38618c", "#f2c14e"]} />
- </div>
- <div className="metric-scroll">
- <table className="backup-table">
- <thead>
- <tr>
- <th>NUMA Node ID</th>
- <th>NUMA Node Name</th>
- <th>Page Life Expectancy (sec)</th>
- </tr>
- </thead>
- <tbody>
- {pleData.length > 0 ? pleData.map((row) => (
- <tr key={row.node_id}>
- <td>{row.node_id}</td>
- <td>{String((row as { node_name?: string }).node_name ?? '-')}</td>
- <td>{row.page_life_expectancy}</td>
- </tr>
- )) : (
- <tr>
- <td colSpan={3}>No PLE metrics returned</td>
- </tr>
- )}
- </tbody>
- </table>
- </div>
+	 <button className="history-btn" style={{ position: 'absolute', top: 16, right: 24, zIndex: 2 }} onClick={() => openHistoryView('ple')}>History View</button>
+	 <div className="metric-bars" aria-label="PLE Trend">
+		 <h4>Recent PLE Trend (24h)</h4>
+		 <MiniBarChart data={pleHourlyBars} height={180} color={["#38618c", "#f2c14e"]} />
+	 </div>
+	 {/* PLE Best Practice Warnings */}
+	 {pleData.length > 1 && (
+		 <div style={{ background: '#fffbe6', color: '#ad6800', padding: '10px', borderRadius: 6, margin: '12px 0', fontSize: 15 }}>
+			 <b>Multiple NUMA nodes detected:</b> PLE should be monitored <b>per NUMA node</b>.<br />
+			 Low PLE values (&lt; 300 sec) on any node may indicate memory pressure. The <b>_Total</b> value is not always representative in multi-NUMA systems.
+		 </div>
+	 )}
+	 {pleData.length === 1 && pleData[0].node_name === '_Total' && (
+		 <div style={{ background: '#e6f7ff', color: '#0050b3', padding: '10px', borderRadius: 6, margin: '12px 0', fontSize: 15 }}>
+			 <b>Single NUMA node or legacy hardware:</b> Only the <b>_Total</b> PLE is available.<br />
+			 Low PLE values (&lt; 300 sec) may indicate memory pressure.
+		 </div>
+	 )}
+	 <div className="metric-scroll">
+		 <table className="backup-table">
+			 <thead>
+				 <tr>
+					 <th>NUMA Node Name</th>
+					 <th>Page Life Expectancy (sec)</th>
+					 <th>Status</th>
+				 </tr>
+			 </thead>
+			 <tbody>
+				 {pleData.length > 0 ? pleData.map((row, idx) => {
+					 const ple = Number(row.page_life_expectancy);
+					 let status = 'OK';
+					 let statusClass = '';
+					 if (ple < 300) {
+						 status = 'LOW';
+						 statusClass = 'backup-stale';
+					 } else if (ple < 1000) {
+						 status = 'Warning';
+						 statusClass = 'backup-warning';
+					 } else {
+						 status = 'Healthy';
+						 statusClass = 'backup-ok';
+					 }
+					 return (
+						 <tr key={row.node_name || idx}>
+							 <td>{String(row.node_name ?? '-')}</td>
+							 <td>{ple}</td>
+							 <td className={statusClass}>{status}</td>
+						 </tr>
+					 );
+				 }) : (
+					 <tr>
+						 <td colSpan={3}>No PLE metrics returned</td>
+					 </tr>
+				 )}
+			 </tbody>
+		 </table>
+	 </div>
  </MetricCard>
  )}
 
@@ -2163,13 +2762,12 @@ export const App = () => {
  {selectedTopic === 'history' && !showHistoryView.topic && (
  <section className="ai-panel" style={{ marginTop: 0 }}>
  <div className="ai-title-row">
- <h2>Monitoring Snapshot Audit Trail</h2>
+ <h2>Monitoring Snapshot Audit Trail (DBA Repository)</h2>
  <div className="snapshot-actions">
  <button onClick={startHistorySearch} disabled={historyLoading}>
  {historyLoading ? 'Loading...' : 'Load History'}
  </button>
- <button onClick={() => void exportSnapshotsCsv()} disabled={historyLoading}>Export CSV (All Filtered)</button>
- <button onClick={() => void exportSnapshotsJson()} disabled={historyLoading}>Export JSON (All Filtered)</button>
+ {renderExportMenu('audit-history', true)}
  </div>
  </div>
  <div className="hero-row" style={{ marginTop: 8 }}>
@@ -2247,8 +2845,8 @@ export const App = () => {
  <thead>
  <tr>
  <th>Snapshot ID</th>
- <th>Captured Timestamp</th>
- <th>Target</th>
+ <th>Captured At</th>
+ <th>Target Instance</th>
  <th>Event</th>
  <th>Health Summary</th>
  <th>Alert Summary</th>
@@ -2268,7 +2866,7 @@ export const App = () => {
  <td title={JSON.stringify(row.alerts)}>{JSON.stringify(row.alerts).slice(0, 80)}{JSON.stringify(row.alerts).length > 80 ? 'ΓÇª' : ''}</td>
  <td>
  <button type="button" onClick={() => setExpandedSnapshotId((current) => current === row.id ? null : row.id)}>
- {expandedSnapshotId === row.id ? 'Hide' : 'View'}
+ {expandedSnapshotId === row.id ? 'Hide Detail' : 'View Detail'}
  </button>
  </td>
  </tr>
@@ -2292,11 +2890,11 @@ export const App = () => {
  </tbody>
  </table>
  <div className="history-pagination">
- <button type="button" disabled={!canGoPrev || historyLoading} onClick={() => void loadSnapshotHistory(Math.max(0, historyOffset - historyLimit))}>Previous</button>
+ <button type="button" disabled={!canGoPrev || historyLoading} onClick={() => void loadSnapshotHistory(Math.max(0, historyOffset - historyLimit))}>Previous Page</button>
  <span>
  Showing {historyRows.length === 0 ? 0 : historyOffset + 1}-{historyOffset + historyRows.length} of {historyTotal}{historyAuditOnly ? ` (filtered: ${historyRows.length}${historyAuditOutcome !== 'all' ? `, outcome: ${historyAuditOutcome}` : ''})` : ''}
  </span>
- <button type="button" disabled={!canGoNext || historyLoading} onClick={() => void loadSnapshotHistory(historyOffset + historyLimit)}>Next</button>
+ <button type="button" disabled={!canGoNext || historyLoading} onClick={() => void loadSnapshotHistory(historyOffset + historyLimit)}>Next Page</button>
  </div>
  </section>
  )}
@@ -2304,16 +2902,16 @@ export const App = () => {
  <section className="ai-panel">
  <button className="history-btn" style={{ position: 'absolute', top: 16, right: 24, zIndex: 2 }} onClick={() => openHistoryView('security')}>History View</button>
  <div className="panel-title-row">
- <h2>Security &amp; Access Control</h2>
+ <h2>Security, Principals &amp; Privilege Posture</h2>
  <button onClick={() => {
  if (selectedTargetId) {
  void loadSecurityForTarget(selectedTargetId);
  }
  }} disabled={securityLoading}>
- {securityLoading ? 'LoadingΓÇª' : 'Refresh Security Data'}
+ {securityLoading ? 'Loading...' : 'Refresh Security Telemetry'}
  </button>
  </div>
- {securityLoading && <p>Loading security dataΓÇª</p>}
+ {securityLoading && <p>Loading security telemetry...</p>}
  {!securityLoading && !securityData && <p>Security data unavailable. Click Refresh to load.</p>}
  {securityData && (
  <>
@@ -2379,14 +2977,14 @@ export const App = () => {
  </table>
  </div>
 
- <h3 style={{ marginTop: 20 }}>Database Users</h3>
+ <h3 style={{ marginTop: 20 }}>Database Principals</h3>
  <div className="metric-scroll">
  <table className="backup-table compact-table">
  <thead>
  <tr>
  <th>Database Name</th>
- <th>User Name</th>
- <th>User Type</th>
+ <th>Principal Name</th>
+ <th>Principal Type</th>
  <th>Mapped Login</th>
  <th>Default Schema</th>
  <th>Database Roles</th>
@@ -2411,7 +3009,7 @@ export const App = () => {
  </table>
  </div>
 
- <h3 style={{ marginTop: 20 }}>Database-Level Role Memberships</h3>
+ <h3 style={{ marginTop: 20 }}>Database Role Memberships</h3>
  <div className="metric-scroll">
  <table className="backup-table compact-table">
  <thead>
@@ -2437,7 +3035,7 @@ export const App = () => {
  </table>
  </div>
 
- <h3 style={{ marginTop: 20 }}>Explicit Object Permissions</h3>
+ <h3 style={{ marginTop: 20 }}>Explicit Object-Level Permissions</h3>
  <div className="metric-scroll">
  <table className="backup-table compact-table">
  <thead>

@@ -9,7 +9,7 @@ const candidateEnvPaths = [
 ];
 
 for (const envPath of candidateEnvPaths) {
-  dotenv.config({ path: envPath });
+  dotenv.config({ path: envPath, override: true });
 }
 
 const envSchema = z.object({
@@ -20,6 +20,7 @@ const envSchema = z.object({
   DB_NAME: z.string().default('master'),
   APP_PORT: z.coerce.number().default(4000),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
+  JWT_SECRET: z.string().default('supersecretkey'),
   DB_TARGETS_ENCRYPTION_KEY: z.string().optional(),
   AI_PROVIDER: z.enum(['local', 'openai']).default('local'),
   OPENAI_API_KEY: z.string().optional(),
@@ -40,6 +41,7 @@ export const env = {
   DB_NAME: parsed.data.DB_NAME,
   APP_PORT: process.env.APP_PORT || 5000,
   CORS_ORIGIN: parsed.data.CORS_ORIGIN,
+  JWT_SECRET: parsed.data.JWT_SECRET,
   DB_TARGETS_ENCRYPTION_KEY: parsed.data.DB_TARGETS_ENCRYPTION_KEY,
   AI_PROVIDER: parsed.data.AI_PROVIDER,
   OPENAI_API_KEY: parsed.data.OPENAI_API_KEY,

@@ -2,7 +2,8 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json* ./
 COPY apps/frontend/package.json ./apps/frontend/package.json
-RUN npm install
+# Clean install: remove node_modules and lock file if present
+RUN rm -rf node_modules package-lock.json && npm install
 COPY . .
 RUN npm run build -w apps/frontend
 
